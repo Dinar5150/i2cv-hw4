@@ -151,6 +151,8 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         self.colors = torch.from_numpy(scene.colors).to(self.device, dtype=torch.float32).clamp(
             0.0, 1.0
         )
+        if self.colors.ndim == 2:
+            self.colors = self.colors.unsqueeze(0)  # renderer expects [B, N, C]
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
             quats = torch.from_numpy(rotations).to(self.device, dtype=torch.float32)
