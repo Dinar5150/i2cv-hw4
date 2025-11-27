@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -59,6 +60,8 @@ class GaussianScene:
     grid_spacing: np.ndarray = field(repr=False)
     object_candidates: List[ObjectCandidate] = field(default_factory=list)
     rotations: np.ndarray | None = None
+    sh_degree: int = 0
+    sh_coeffs: np.ndarray | None = None
 
     @property
     def diagonal_length(self) -> float:
@@ -164,7 +167,9 @@ class SceneExplorer:
         path = Path(ply_path)
         if not path.exists():
             raise FileNotFoundError(path)
-        positions, colors, scales, opacity, rotations = self._parse_ply(path)
+        positions, colors, scales, opacity, rotations, sh_coeffs, sh_degree = (
+            self._parse_ply(path)
+        )
         bounds_min = positions.min(axis=0)
         bounds_max = positions.max(axis=0)
         scene_type = declared_type or self._infer_scene_type(bounds_min, bounds_max)
@@ -187,6 +192,8 @@ class SceneExplorer:
             grid_origin=origin,
             grid_spacing=spacing,
             object_candidates=candidates,
+            sh_degree=sh_degree,
+            sh_coeffs=sh_coeffs,
         )
 
     def generate_waypoints(
@@ -243,7 +250,15 @@ class SceneExplorer:
 
     def _parse_ply(
         self, path: Path
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+        int,
+    ]:
         if PlyData is None:  # pragma: no cover - runtime dependency guard.
             raise _safe_import_error("plyfile")
         ply = PlyData.read(str(path))
@@ -251,19 +266,23 @@ class SceneExplorer:
         if "packed_position" in vertex.dtype.names:
             return self._decode_supersplat(ply, vertex)
         positions = self._extract_positions(vertex)
-        colors = self._extract_colors(vertex)
+        colors, sh_coeffs, sh_degree = self._extract_colors(vertex)
         scales = self._extract_scales(vertex)
-        opacity = (
-            vertex["opacity"].astype(np.float32)
-            if "opacity" in vertex.dtype.names
-            else np.ones(len(vertex), dtype=np.float32)
-        )
+        opacity = self._extract_opacity(vertex)
         rotations = self._extract_rotations(vertex)
-        return positions, colors, scales, opacity, rotations
+        return positions, colors, scales, opacity, rotations, sh_coeffs, sh_degree
 
     def _decode_supersplat(
         self, ply: "PlyData", vertex: np.ndarray, chunk_size: int = 256
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        None,
+        int,
+    ]:
         chunks = ply["chunk"].data
         chunk_ids = np.arange(len(vertex), dtype=np.int64) // chunk_size
         chunk_ids = np.clip(chunk_ids, 0, len(chunks) - 1)
@@ -307,6 +326,8 @@ class SceneExplorer:
             scales.astype(np.float32),
             opacity,
             rotations,
+            None,
+            0,
         )
 
     def _decode_triplet(self, packed: np.ndarray) -> np.ndarray:
@@ -379,25 +400,40 @@ class SceneExplorer:
             f"Found properties: {names}"
         )
 
-    def _extract_colors(self, vertex: np.ndarray) -> np.ndarray:
+    def _extract_colors(self, vertex: np.ndarray) -> Tuple[np.ndarray, np.ndarray | None, int]:
         names = vertex.dtype.names
         if all(col in names for col in ("f_dc_0", "f_dc_1", "f_dc_2")):
-            colors = np.column_stack(
+            dc = np.column_stack(
                 (vertex["f_dc_0"], vertex["f_dc_1"], vertex["f_dc_2"])
             ).astype(np.float32)
-            colors = 1 / (1 + np.exp(-colors))  # sigmoid decode
+            rest_cols = sorted(
+                [name for name in names if name.startswith("f_rest_")],
+                key=lambda n: int(n.split("_")[-1]),
+            )
+            if rest_cols:
+                rest = np.column_stack([vertex[name] for name in rest_cols]).astype(
+                    np.float32
+                )
+                sh_coeffs = np.concatenate([dc, rest], axis=1)
+            else:
+                sh_coeffs = dc
+            terms = sh_coeffs.shape[1] // 3
+            sh_degree = max(int(round(math.sqrt(terms) - 1)), 0)
+            colors = 1 / (1 + np.exp(-dc))  # sigmoid decode for preview/lite renderer
             colors = np.clip(colors, 0.0, 1.0)
+            return colors, sh_coeffs.astype(np.float32), sh_degree
         elif all(col in names for col in ("red", "green", "blue")):
             colors = (
                 np.column_stack((vertex["red"], vertex["green"], vertex["blue"]))
                 / 255.0
             ).astype(np.float32)
+            return colors, None, 0
         elif "packed_color" in names:
             arr = self._unpack_vector_property(vertex["packed_color"])
             colors = np.clip(arr[:, :3], 0.0, 1.0).astype(np.float32)
-        else:
-            colors = np.ones((len(vertex), 3), dtype=np.float32) * 0.5
-        return colors
+            return colors, None, 0
+        colors = np.ones((len(vertex), 3), dtype=np.float32) * 0.5
+        return colors, None, 0
 
     def _extract_scales(self, vertex: np.ndarray) -> np.ndarray:
         names = vertex.dtype.names
@@ -411,7 +447,18 @@ class SceneExplorer:
             scales = arr[:, :3].astype(np.float32)
         else:
             scales = np.full((len(vertex), 3), 0.02, dtype=np.float32)
+        scales = np.exp(scales)
+        scales = np.clip(scales, 1e-4, 2.0)
         return scales
+
+    def _extract_opacity(self, vertex: np.ndarray) -> np.ndarray:
+        names = vertex.dtype.names
+        if "opacity" in names:
+            raw = vertex["opacity"].astype(np.float32)
+        else:
+            raw = np.ones(len(vertex), dtype=np.float32)
+        opacity = 1 / (1 + np.exp(-raw))
+        return np.clip(opacity, 1e-4, 1.0)
 
     def _extract_rotations(self, vertex: np.ndarray) -> np.ndarray | None:
         names = vertex.dtype.names

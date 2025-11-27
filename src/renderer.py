@@ -142,23 +142,31 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
     def _prepare_scene_tensors(self, scene: GaussianScene) -> None:
         torch = self.torch
         self.means = torch.from_numpy(scene.positions).to(self.device, dtype=torch.float32)
+        self.means = self.means.unsqueeze(0)
         self.scales = torch.from_numpy(scene.scales).to(self.device, dtype=torch.float32).clamp(
             min=1e-4
         )
+        self.scales = self.scales.unsqueeze(0)
         self.opacities = torch.from_numpy(scene.opacity).to(self.device, dtype=torch.float32).clamp(
             0.01, 1.0
         )
-        self.colors = torch.from_numpy(scene.colors).to(self.device, dtype=torch.float32).clamp(
-            0.0, 1.0
-        )
-        if self.colors.ndim == 2:
-            self.colors = self.colors.unsqueeze(0)  # renderer expects [B, N, C]
+        if self.opacities.ndim == 2 and self.opacities.shape[-1] == 1:
+            self.opacities = self.opacities.squeeze(-1)
+        self.opacities = self.opacities.unsqueeze(0)
+        color_src = scene.sh_coeffs if scene.sh_coeffs is not None else scene.colors
+        colors = torch.from_numpy(color_src).to(self.device, dtype=torch.float32)
+        self.sh_degree = int(scene.sh_degree) if scene.sh_coeffs is not None else 0
+        if colors.ndim == 2:
+            colors = colors.unsqueeze(0)  # renderer expects [B, N, C]
+        self.colors = colors
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
             quats = torch.from_numpy(rotations).to(self.device, dtype=torch.float32)
         else:
             quats = torch.zeros((len(scene.positions), 4), dtype=torch.float32, device=self.device)
             quats[:, 3] = 1.0  # identity quaternion
+        if quats.ndim == 2:
+            quats = quats.unsqueeze(0)
         self.quats = quats
         self.background_color = torch.zeros(3, dtype=torch.float32, device=self.device)
 
@@ -180,6 +188,7 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             K,
             width,
             height,
+            sh_degree=self.sh_degree,
         )
         frame = (
             render_colors[0]
