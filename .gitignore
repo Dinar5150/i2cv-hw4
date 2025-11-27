@@ -1,0 +1,5 @@
+.venv
+input-data
+__pycache__
+*.pyc
+tmp_*
