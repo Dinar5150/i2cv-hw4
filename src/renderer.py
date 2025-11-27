@@ -188,10 +188,11 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             K,
             width,
             height,
+            backgrounds=self._background_tensor(view.shape[-3]),
             sh_degree=self.sh_degree,
         )
         frame = (
-            render_colors[0]
+            render_colors.reshape(-1, 3, height, width)[0]
             .clamp(0.0, 1.0)
             .mul(255.0)
             .byte()
@@ -219,28 +220,24 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         view[1, :3] = up_vec
         view[2, :3] = -forward
         view[:3, 3] = -view[:3, :3] @ position
-        view = view.unsqueeze(0)
+        batch_shape = tuple(self.means.shape[:-2])
+        expand_shape = batch_shape + (1, 4, 4)
+        view = view.reshape((1,) * len(batch_shape) + (1, 4, 4)).expand(*expand_shape).contiguous()
         K = torch.tensor(
             [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
             device=self.device,
             dtype=torch.float32,
-        ).unsqueeze(0)
+        )
+        K = K.reshape((1,) * len(batch_shape) + (1, 3, 3)).expand(
+            *batch_shape, 1, 3, 3
+        ).contiguous()
         return view, K
 
-    def _background_tensor(self, height: int, width: int):
-        torch = self.torch
-        bg_color = self.background_color.view(1, 1, 3)
-        bg = torch.ones(
-            (height, width, 3),
-            device=self.device,
-            dtype=torch.float32,
-        ).mul(bg_color)
-        
-        # REQUIRED: Add this back to make shape (1, Height, Width, 3)
-        if bg.ndim == 3:
-            bg = bg.unsqueeze(0)
-            
-        return bg.contiguous()
+    def _background_tensor(self, num_views: int) -> "torch.Tensor":
+        batch_shape = tuple(self.means.shape[:-2])
+        bg = self.background_color.reshape((1,) * len(batch_shape) + (1, 3))
+        expand_shape = batch_shape + (num_views, 3)
+        return bg.expand(*expand_shape).contiguous()
 
 
 class _LiteGaussianBackend(_RendererBackend):
