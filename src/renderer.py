@@ -178,7 +178,6 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             K,
             width,
             height,
-            backgrounds=self._background_tensor(height, width),
         )
         frame = (
             render_colors[0]
@@ -225,6 +224,11 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             device=self.device,
             dtype=torch.float32,
         ).mul(bg_color)
+        
+        # REQUIRED: Add this back to make shape (1, Height, Width, 3)
+        if bg.ndim == 3:
+            bg = bg.unsqueeze(0)
+            
         return bg.contiguous()
 
 
