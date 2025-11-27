@@ -50,6 +50,7 @@ class GaussianScene:
     colors: np.ndarray
     scales: np.ndarray
     opacity: np.ndarray
+    rotations: np.ndarray | None = None
     scene_type: SceneType
     bounds_min: np.ndarray
     bounds_max: np.ndarray
@@ -163,7 +164,7 @@ class SceneExplorer:
         path = Path(ply_path)
         if not path.exists():
             raise FileNotFoundError(path)
-        positions, colors, scales, opacity = self._parse_ply(path)
+        positions, colors, scales, opacity, rotations = self._parse_ply(path)
         bounds_min = positions.min(axis=0)
         bounds_max = positions.max(axis=0)
         scene_type = declared_type or self._infer_scene_type(bounds_min, bounds_max)
@@ -177,6 +178,7 @@ class SceneExplorer:
             colors=colors,
             scales=scales,
             opacity=opacity,
+            rotations=rotations,
             scene_type=scene_type,
             bounds_min=bounds_min,
             bounds_max=bounds_max,
@@ -239,7 +241,9 @@ class SceneExplorer:
         )
         return weights.reshape(2, 2, 2)
 
-    def _parse_ply(self, path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _parse_ply(
+        self, path: Path
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         if PlyData is None:  # pragma: no cover - runtime dependency guard.
             raise _safe_import_error("plyfile")
         ply = PlyData.read(str(path))
@@ -254,11 +258,12 @@ class SceneExplorer:
             if "opacity" in vertex.dtype.names
             else np.ones(len(vertex), dtype=np.float32)
         )
-        return positions, colors, scales, opacity
+        rotations = self._extract_rotations(vertex)
+        return positions, colors, scales, opacity, rotations
 
     def _decode_supersplat(
         self, ply: "PlyData", vertex: np.ndarray, chunk_size: int = 256
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         chunks = ply["chunk"].data
         chunk_ids = np.arange(len(vertex), dtype=np.int64) // chunk_size
         chunk_ids = np.clip(chunk_ids, 0, len(chunks) - 1)
@@ -292,8 +297,15 @@ class SceneExplorer:
         colors = color_min[chunk_ids] + (color_max - color_min)[chunk_ids] * color_norm
         colors = np.clip(colors, 0.0, 1.0)
 
+        rotations = self._decode_rotations(vertex["packed_rotation"])
         opacity = np.ones(len(vertex), dtype=np.float32)
-        return positions.astype(np.float32), colors, scales.astype(np.float32), opacity
+        return (
+            positions.astype(np.float32),
+            colors,
+            scales.astype(np.float32),
+            opacity,
+            rotations,
+        )
 
     def _decode_triplet(self, packed: np.ndarray) -> np.ndarray:
         vals = packed.astype(np.uint32)
@@ -302,6 +314,22 @@ class SceneExplorer:
         c = (vals >> 2) & 0x3FF
         arr = np.stack((a, b, c), axis=1).astype(np.float32) / 1023.0
         return arr
+
+    def _decode_rotations(self, packed: np.ndarray) -> np.ndarray:
+        vals = packed.astype(np.uint32)
+        comp0 = (vals >> 21) & 0x7FF
+        comp1 = (vals >> 11) & 0x3FF
+        comp2 = (vals >> 1) & 0x3FF
+        sign = np.where((vals & 0x1) > 0, -1.0, 1.0)
+        x = comp0.astype(np.float32) / 2047.0 * 2.0 - 1.0
+        y = comp1.astype(np.float32) / 1023.0 * 2.0 - 1.0
+        z = comp2.astype(np.float32) / 1023.0 * 2.0 - 1.0
+        mag = x * x + y * y + z * z
+        w = np.sqrt(np.maximum(0.0, 1.0 - mag)) * sign.astype(np.float32)
+        quats = np.stack((x, y, z, w), axis=1)
+        norms = np.linalg.norm(quats, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-6)
+        return (quats / norms).astype(np.float32)
 
     def _extract_positions(self, vertex: np.ndarray) -> np.ndarray:
         names = vertex.dtype.names
@@ -377,6 +405,22 @@ class SceneExplorer:
         else:
             scales = np.full((len(vertex), 3), 0.02, dtype=np.float32)
         return scales
+
+    def _extract_rotations(self, vertex: np.ndarray) -> np.ndarray | None:
+        names = vertex.dtype.names
+        candidate_sets = [
+            tuple(f"rotation_{i}" for i in range(4)),
+            tuple(f"rot_{i}" for i in range(4)),
+            ("rot_x", "rot_y", "rot_z", "rot_w"),
+            ("qx", "qy", "qz", "qw"),
+        ]
+        for cols in candidate_sets:
+            if all(col in names for col in cols):
+                quats = np.column_stack([vertex[col] for col in cols]).astype(np.float32)
+                norms = np.linalg.norm(quats, axis=1, keepdims=True)
+                norms = np.maximum(norms, 1e-6)
+                return quats / norms
+        return None
 
     def _unpack_vector_property(self, data: np.ndarray) -> np.ndarray:
         arr = np.asarray(data)
