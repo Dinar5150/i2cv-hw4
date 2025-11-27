@@ -221,7 +221,15 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
 
     def _background_tensor(self, height: int, width: int):
         torch = self.torch
-        bg = self.background_color.view(1, 1, 1, 3).repeat(1, height, width, 1)
+        bg_color = self.background_color.view(1, 1, 3)
+        bg = torch.ones(
+            (height, width, 3),
+            device=self.device,
+            dtype=torch.float32,
+        ).mul(bg_color)
+        if bg.ndim == 3:  # defensive guard for older torch repeat semantics.
+            bg = bg.unsqueeze(0)
+        assert bg.ndim == 4, f"Background tensor must be 4D, got {bg.shape}"
         return bg.contiguous()
 
 
