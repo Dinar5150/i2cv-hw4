@@ -50,7 +50,6 @@ class GaussianScene:
     colors: np.ndarray
     scales: np.ndarray
     opacity: np.ndarray
-    rotations: np.ndarray | None = None
     scene_type: SceneType
     bounds_min: np.ndarray
     bounds_max: np.ndarray
@@ -59,6 +58,7 @@ class GaussianScene:
     grid_origin: np.ndarray = field(repr=False)
     grid_spacing: np.ndarray = field(repr=False)
     object_candidates: List[ObjectCandidate] = field(default_factory=list)
+    rotations: np.ndarray | None = None
 
     @property
     def diagonal_length(self) -> float:
