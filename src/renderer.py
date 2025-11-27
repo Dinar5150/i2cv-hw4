@@ -209,11 +209,12 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         view[1, :3] = up_vec
         view[2, :3] = -forward
         view[:3, 3] = -view[:3, :3] @ position
+        view = view.unsqueeze(0)
         K = torch.tensor(
             [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
             device=self.device,
             dtype=torch.float32,
-        )
+        ).unsqueeze(0)
         return view, K
 
     def _background_tensor(self, height: int, width: int):
