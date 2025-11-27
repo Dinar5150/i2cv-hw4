@@ -221,12 +221,8 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
 
     def _background_tensor(self, height: int, width: int):
         torch = self.torch
-        bg = (
-            self.background_color.view(1, 1, 1, 3)
-            .expand(1, height, width, 3)
-            .contiguous()
-        )
-        return bg
+        bg = self.background_color.view(1, 1, 1, 3).repeat(1, height, width, 1)
+        return bg.contiguous()
 
 
 class _LiteGaussianBackend(_RendererBackend):
