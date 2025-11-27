@@ -286,6 +286,8 @@ class SceneExplorer:
         scales_norm = self._decode_triplet(vertex["packed_scale"])
         log_scales = log_min[chunk_ids] + (log_max - log_min)[chunk_ids] * scales_norm
         scales = np.exp(log_scales)
+        # Guard against extreme scales that create blown-up splats.
+        scales = np.clip(scales, 1e-4, 1.0)
 
         color_min = np.column_stack(
             (chunks["min_r"], chunks["min_g"], chunks["min_b"])
@@ -316,12 +318,17 @@ class SceneExplorer:
         return arr
 
     def _decode_rotations(self, packed: np.ndarray) -> np.ndarray:
+        """
+        Decode Supersplat packed rotations (3x10-bit octahedral mapping + sign).
+        The layout uses 10 bits per xyz component plus a sign bit for w.
+        """
         vals = packed.astype(np.uint32)
-        comp0 = (vals >> 21) & 0x7FF
-        comp1 = (vals >> 11) & 0x3FF
-        comp2 = (vals >> 1) & 0x3FF
+        comp0 = (vals >> 22) & 0x3FF
+        comp1 = (vals >> 12) & 0x3FF
+        comp2 = (vals >> 2) & 0x3FF
+        # Remaining bit(s) carry sign for w; default to +1 when absent.
         sign = np.where((vals & 0x1) > 0, -1.0, 1.0)
-        x = comp0.astype(np.float32) / 2047.0 * 2.0 - 1.0
+        x = comp0.astype(np.float32) / 1023.0 * 2.0 - 1.0
         y = comp1.astype(np.float32) / 1023.0 * 2.0 - 1.0
         z = comp2.astype(np.float32) / 1023.0 * 2.0 - 1.0
         mag = x * x + y * y + z * z
