@@ -151,8 +151,6 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         self.colors = torch.from_numpy(scene.colors).to(self.device, dtype=torch.float32).clamp(
             0.0, 1.0
         )
-        if self.colors.ndim == 2:
-            self.colors = self.colors.unsqueeze(0)  # renderer expects [..., N, C]
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
             quats = torch.from_numpy(rotations).to(self.device, dtype=torch.float32)
@@ -211,12 +209,11 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         view[1, :3] = up_vec
         view[2, :3] = -forward
         view[:3, 3] = -view[:3, :3] @ position
-        view = view.unsqueeze(0)
         K = torch.tensor(
             [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
             device=self.device,
             dtype=torch.float32,
-        ).unsqueeze(0)
+        )
         return view, K
 
     def _background_tensor(self, height: int, width: int):
@@ -227,9 +224,6 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             device=self.device,
             dtype=torch.float32,
         ).mul(bg_color)
-        if bg.ndim == 3:  # defensive guard for older torch repeat semantics.
-            bg = bg.unsqueeze(0)
-        assert bg.ndim == 4, f"Background tensor must be 4D, got {bg.shape}"
         return bg.contiguous()
 
 
