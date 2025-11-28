@@ -143,55 +143,45 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
 
     def _prepare_scene_tensors(self, scene: GaussianScene) -> None:
         torch = self.torch
-        def _add_batch_dim(tensor: "torch.Tensor") -> "torch.Tensor":
-            if tensor.ndim == 1:
-                return tensor.unsqueeze(0).contiguous()
-            if tensor.ndim == 2:
-                return tensor.unsqueeze(0).contiguous()
-            return tensor.contiguous()
 
-        self.means = _add_batch_dim(
-            torch.from_numpy(scene.positions).to(self.device, dtype=torch.float32)
-        )
-        self.scales = _add_batch_dim(
-            torch.from_numpy(scene.scales).to(self.device, dtype=torch.float32).clamp(min=1e-4)
-        )
-        opacities = torch.from_numpy(scene.opacity).to(self.device, dtype=torch.float32).clamp(
-            0.01, 1.0
-        )
+        def _to_tensor(array: np.ndarray) -> "torch.Tensor":
+            return torch.from_numpy(array).to(self.device, dtype=torch.float32).contiguous()
+
+        means = _to_tensor(scene.positions)
+        scales = _to_tensor(scene.scales).clamp(min=1e-4)
+        opacities = _to_tensor(scene.opacity).clamp(0.01, 1.0)
         if opacities.ndim == 2 and opacities.shape[-1] == 1:
             opacities = opacities.squeeze(-1)
-        self.opacities = _add_batch_dim(opacities)
-        color_src = scene.sh_coeffs if scene.sh_coeffs is not None else scene.colors
-        colors = torch.from_numpy(color_src).to(self.device, dtype=torch.float32)
-        self.sh_degree = int(scene.sh_degree) if scene.sh_coeffs is not None else 0
-        self.colors = _add_batch_dim(colors)
+
+        if scene.sh_coeffs is not None:
+            coeffs = _to_tensor(scene.sh_coeffs)
+            terms = coeffs.shape[1] // 3
+            colors = coeffs.view(coeffs.shape[0], terms, 3)
+            self.sh_degree = int(scene.sh_degree)
+        else:
+            base_colors = _to_tensor(scene.colors)
+            colors = base_colors.unsqueeze(1)
+            self.sh_degree = 0
+
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
-            quats = torch.from_numpy(rotations).to(self.device, dtype=torch.float32)
+            quats = _to_tensor(rotations)
         else:
             quats = torch.zeros((len(scene.positions), 4), dtype=torch.float32, device=self.device)
-            quats[:, 3] = 1.0  # identity quaternion
-        self.quats = _add_batch_dim(quats)
+            quats[:, 3] = 1.0
 
-        def _squeeze_first_dim(tensor: "torch.Tensor") -> "torch.Tensor | None":
-            return tensor.squeeze(0).contiguous() if tensor.shape[0] == 1 else None
+        self._flat_means = means
+        self._flat_scales = scales
+        self._flat_opacities = opacities
+        self._flat_colors = colors
+        self._flat_quats = quats
 
-        self._flat_means = _squeeze_first_dim(self.means)
-        self._flat_scales = _squeeze_first_dim(self.scales)
-        self._flat_opacities = _squeeze_first_dim(self.opacities)
-        self._flat_colors = _squeeze_first_dim(self.colors)
-        self._flat_quats = _squeeze_first_dim(self.quats)
-        self._flat_available = all(
-            tensor is not None
-            for tensor in (
-                self._flat_means,
-                self._flat_scales,
-                self._flat_opacities,
-                self._flat_colors,
-                self._flat_quats,
-            )
-        )
+        self.means = means.unsqueeze(0)
+        self.scales = scales.unsqueeze(0)
+        self.opacities = opacities.unsqueeze(0)
+        self.colors = colors.unsqueeze(0)
+        self.quats = quats.unsqueeze(0)
+        self._flat_available = True
 
     def render(
         self,
