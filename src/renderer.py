@@ -153,6 +153,8 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         color_src = scene.sh_coeffs if scene.sh_coeffs is not None else scene.colors
         colors = torch.from_numpy(color_src).to(self.device, dtype=torch.float32)
         self.sh_degree = int(scene.sh_degree) if scene.sh_coeffs is not None else 0
+        if colors.ndim == 2:
+            colors = colors.unsqueeze(0)
         self.colors = colors
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
