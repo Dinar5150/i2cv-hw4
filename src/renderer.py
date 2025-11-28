@@ -137,32 +137,61 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         self.torch = torch
         self.rasterize = rasterization
         self.device = torch.device(device)
+        self._layout_mode: str | None = None
+        self._flat_available = False
         self._prepare_scene_tensors(scene)
 
     def _prepare_scene_tensors(self, scene: GaussianScene) -> None:
         torch = self.torch
-        self.means = torch.from_numpy(scene.positions).to(self.device, dtype=torch.float32)
-        self.scales = torch.from_numpy(scene.scales).to(self.device, dtype=torch.float32).clamp(
-            min=1e-4
+        def _add_batch_dim(tensor: "torch.Tensor") -> "torch.Tensor":
+            if tensor.ndim == 1:
+                return tensor.unsqueeze(0).contiguous()
+            if tensor.ndim == 2:
+                return tensor.unsqueeze(0).contiguous()
+            return tensor.contiguous()
+
+        self.means = _add_batch_dim(
+            torch.from_numpy(scene.positions).to(self.device, dtype=torch.float32)
         )
-        self.opacities = torch.from_numpy(scene.opacity).to(self.device, dtype=torch.float32).clamp(
+        self.scales = _add_batch_dim(
+            torch.from_numpy(scene.scales).to(self.device, dtype=torch.float32).clamp(min=1e-4)
+        )
+        opacities = torch.from_numpy(scene.opacity).to(self.device, dtype=torch.float32).clamp(
             0.01, 1.0
         )
-        if self.opacities.ndim == 2 and self.opacities.shape[-1] == 1:
-            self.opacities = self.opacities.squeeze(-1)
+        if opacities.ndim == 2 and opacities.shape[-1] == 1:
+            opacities = opacities.squeeze(-1)
+        self.opacities = _add_batch_dim(opacities)
         color_src = scene.sh_coeffs if scene.sh_coeffs is not None else scene.colors
         colors = torch.from_numpy(color_src).to(self.device, dtype=torch.float32)
         self.sh_degree = int(scene.sh_degree) if scene.sh_coeffs is not None else 0
-        if colors.ndim == 2:
-            colors = colors.unsqueeze(0)
-        self.colors = colors
+        self.colors = _add_batch_dim(colors)
         rotations = getattr(scene, "rotations", None)
         if rotations is not None:
             quats = torch.from_numpy(rotations).to(self.device, dtype=torch.float32)
         else:
             quats = torch.zeros((len(scene.positions), 4), dtype=torch.float32, device=self.device)
             quats[:, 3] = 1.0  # identity quaternion
-        self.quats = quats
+        self.quats = _add_batch_dim(quats)
+
+        def _squeeze_first_dim(tensor: "torch.Tensor") -> "torch.Tensor | None":
+            return tensor.squeeze(0).contiguous() if tensor.shape[0] == 1 else None
+
+        self._flat_means = _squeeze_first_dim(self.means)
+        self._flat_scales = _squeeze_first_dim(self.scales)
+        self._flat_opacities = _squeeze_first_dim(self.opacities)
+        self._flat_colors = _squeeze_first_dim(self.colors)
+        self._flat_quats = _squeeze_first_dim(self.quats)
+        self._flat_available = all(
+            tensor is not None
+            for tensor in (
+                self._flat_means,
+                self._flat_scales,
+                self._flat_opacities,
+                self._flat_colors,
+                self._flat_quats,
+            )
+        )
 
     def render(
         self,
@@ -172,27 +201,84 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
     ) -> np.ndarray:
         width, height = resolution
         view, K = self._camera_matrices(pose, width, height)
-        render_colors, _, _ = self.rasterize(
-            self.means,
-            self.quats,
-            self.scales,
-            self.opacities,
-            self.colors,
-            view,
-            K,
+        layouts = self._layout_attempt_order()
+        last_exc: Exception | None = None
+        for layout in layouts:
+            try:
+                render_colors, _, _ = self._run_rasterize(layout, view, K, width, height)
+            except AssertionError as exc:
+                last_exc = exc
+                if self._should_retry_with_flat(layout, exc):
+                    continue
+                raise
+            else:
+                if self._layout_mode is None:
+                    self._layout_mode = layout
+                return self._tensor_to_frame(render_colors)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Rasterization failed without raising an exception.")
+
+    def _layout_attempt_order(self) -> List[str]:
+        if self._layout_mode == "batched":
+            return ["batched"]
+        if self._layout_mode == "flat":
+            return ["flat"]
+        order = ["batched"]
+        if self._flat_available:
+            order.append("flat")
+        return order
+
+    def _should_retry_with_flat(self, layout: str, exc: AssertionError) -> bool:
+        if layout != "batched" or not self._flat_available or self._layout_mode is not None:
+            return False
+        torch = self.torch
+        return len(exc.args) == 1 and isinstance(exc.args[0], torch.Size)
+
+    def _run_rasterize(
+        self,
+        layout: str,
+        view: "torch.Tensor",
+        K: "torch.Tensor",
+        width: int,
+        height: int,
+    ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        if layout == "batched":
+            means = self.means
+            quats = self.quats
+            scales = self.scales
+            opacities = self.opacities
+            colors = self.colors
+            view_arg = view
+            K_arg = K
+        else:
+            if not self._flat_available:
+                raise RuntimeError("Flat layout requested but not available.")
+            means = self._flat_means
+            quats = self._flat_quats
+            scales = self._flat_scales
+            opacities = self._flat_opacities
+            colors = self._flat_colors
+            view_arg = view.squeeze(0) if view.ndim == 3 else view
+            K_arg = K.squeeze(0) if K.ndim == 3 else K
+        return self.rasterize(
+            means,
+            quats,
+            scales,
+            opacities,
+            colors,
+            view_arg,
+            K_arg,
             width,
             height,
             sh_degree=self.sh_degree,
         )
-        frame = (
-            render_colors[0]
-            .clamp(0.0, 1.0)
-            .mul(255.0)
-            .byte()
-            .cpu()
-            .numpy()
-        )
-        return frame
+
+    def _tensor_to_frame(self, tensor: "torch.Tensor") -> np.ndarray:
+        if tensor.ndim == 4:
+            tensor = tensor[0]
+        tensor = tensor.clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
+        return tensor
 
     def _camera_matrices(
         self, pose: CameraPose, width: int, height: int
