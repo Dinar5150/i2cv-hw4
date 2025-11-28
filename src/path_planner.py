@@ -75,9 +75,10 @@ class CameraPathPlanner:
         base_path = self._build_catmull_rom_path(waypoints, samples * 4)
         positions = self._reparameterize(base_path, samples)
         safe_positions = self._ensure_clearance(scene, positions)
-        forwards = self._compute_forward_vectors(safe_positions)
+        grounded_positions = self._apply_grounding(scene, safe_positions)
+        forwards = self._compute_forward_vectors(grounded_positions)
         poses = self._poses_from_vectors(
-            safe_positions,
+            grounded_positions,
             forwards,
             duration,
             bias=scene.scene_type,
@@ -179,6 +180,31 @@ class CameraPathPlanner:
                 safe[idx] = point + normal * (desired - clearance + 1e-2)
             safe[idx] = np.clip(safe[idx], scene.bounds_min + 0.1, scene.bounds_max - 0.1)
         return safe
+
+    def _apply_grounding(self, scene: GaussianScene, positions: np.ndarray) -> np.ndarray:
+        """
+        Bias camera heights towards a human-held viewpoint and smooth
+        vertical movement to prevent large up/down swings.
+        """
+
+        grounded = positions.copy()
+        floor = float(scene.bounds_min[1]) + 0.2
+        ceiling = float(scene.bounds_max[1]) - 0.2
+        headroom = 1.8 if scene.scene_type == SceneType.INDOOR else 2.3
+        target_top = min(floor + headroom, ceiling)
+        min_height = min(floor + 0.4, target_top)
+        grounded[:, 1] = np.clip(grounded[:, 1], min_height, target_top)
+        grounded[:, 1] = self._smooth_signal(grounded[:, 1], window=19)
+        grounded[:, 1] = np.clip(grounded[:, 1], min_height, target_top)
+        return grounded
+
+    def _smooth_signal(self, values: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return values
+        kernel = np.ones(window, dtype=np.float32) / window
+        padded = np.pad(values, (window // 2,), mode="edge")
+        smoothed = np.convolve(padded, kernel, mode="valid")
+        return smoothed.astype(np.float32)
 
     def _estimate_density_gradient(
         self, scene: GaussianScene, point: np.ndarray, epsilon: float = 0.15
