@@ -43,6 +43,7 @@ class CameraPath:
 class PlannerSettings:
     fps: int = 30
     min_clearance: float = 0.6
+    camera_radius: float = 0.35
     max_acceleration: float = 3.0
     look_ahead: float = 2.0
     up_vector: np.ndarray = dataclass_field(default_factory=lambda: np.array([0.0, 1.0, 0.0], dtype=np.float32))
@@ -75,8 +76,13 @@ class CameraPathPlanner:
         base_path = self._build_catmull_rom_path(waypoints, samples * 4)
         positions = self._reparameterize(base_path, samples)
         safe_positions = self._ensure_clearance(scene, positions)
+        safe_positions = self._clamp_to_bounds(scene, safe_positions, margin=0.25)
         grounded_positions = self._apply_grounding(scene, safe_positions)
+        grounded_positions = self._clamp_to_bounds(scene, grounded_positions, margin=0.25)
+        grounded_positions = self._smooth_positions(grounded_positions, window=13)
+        grounded_positions = self._clamp_to_bounds(scene, grounded_positions, margin=0.25)
         forwards = self._compute_forward_vectors(grounded_positions)
+        forwards = self._smooth_vectors(forwards, window=11)
         poses = self._poses_from_vectors(
             grounded_positions,
             forwards,
@@ -171,15 +177,25 @@ class CameraPathPlanner:
         for idx, point in enumerate(positions):
             clearance = self.explorer.estimate_clearance(scene, point)
             density = self.explorer.sample_density(scene, point)
-            desired = self.settings.min_clearance + density * 0.4
-            if clearance + 1e-4 < desired:
+            target = self.settings.camera_radius + self.settings.min_clearance + density * 0.5
+            needs_push = clearance + 1e-4 < target or density > 0.25
+            if needs_push:
                 normal = self._estimate_density_gradient(scene, point)
                 if np.linalg.norm(normal) < 1e-3:
                     normal = self._sample_unit_sphere()
                 normal = normal / np.linalg.norm(normal)
-                safe[idx] = point + normal * (desired - clearance + 1e-2)
+                push = target - clearance + 1e-2
+                push = max(push, 0.05)
+                safe[idx] = point + normal * push
             safe[idx] = np.clip(safe[idx], scene.bounds_min + 0.1, scene.bounds_max - 0.1)
         return safe
+
+    def _clamp_to_bounds(
+        self, scene: GaussianScene, positions: np.ndarray, margin: float = 0.2
+    ) -> np.ndarray:
+        lower = scene.bounds_min + margin
+        upper = scene.bounds_max - margin
+        return np.clip(positions, lower, upper)
 
     def _apply_grounding(self, scene: GaussianScene, positions: np.ndarray) -> np.ndarray:
         """
@@ -198,6 +214,14 @@ class CameraPathPlanner:
         grounded[:, 1] = np.clip(grounded[:, 1], min_height, target_top)
         return grounded
 
+    def _smooth_positions(self, positions: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return positions
+        smoothed = positions.copy()
+        for axis in range(3):
+            smoothed[:, axis] = self._smooth_signal(positions[:, axis], window)
+        return smoothed
+
     def _smooth_signal(self, values: np.ndarray, window: int) -> np.ndarray:
         if window <= 1:
             return values
@@ -205,6 +229,14 @@ class CameraPathPlanner:
         padded = np.pad(values, (window // 2,), mode="edge")
         smoothed = np.convolve(padded, kernel, mode="valid")
         return smoothed.astype(np.float32)
+
+    def _smooth_vectors(self, vectors: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return vectors
+        smoothed = self._smooth_positions(vectors, window)
+        norms = np.linalg.norm(smoothed, axis=1, keepdims=True)
+        norms = np.clip(norms, 1e-6, None)
+        return smoothed / norms
 
     def _estimate_density_gradient(
         self, scene: GaussianScene, point: np.ndarray, epsilon: float = 0.15
