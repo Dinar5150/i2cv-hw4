@@ -259,8 +259,8 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
             scales = self._flat_scales
             opacities = self._flat_opacities
             colors = self._flat_colors
-            view_arg = view.squeeze(0) if view.ndim == 3 else view
-            K_arg = K.squeeze(0) if K.ndim == 3 else K
+            view_arg = view
+            K_arg = K
         return self.rasterize(
             means,
             quats,
