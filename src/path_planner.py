@@ -1,20 +1,25 @@
 """
 Camera path planning for cinematic Gaussian Splatting fly-throughs.
 
-The planner:
-- Receives coverage waypoints from `SceneExplorer`.
-- Builds smooth, spline-based camera trajectories with ease-in/out motion.
-- Enforces collision safety through local density sampling.
-- Exposes helper utilities for object-focused highlight tours.
+This overhaul focuses on robust indoor navigation:
+- Build a 2D navigation field from the scene density grid to stay inside the
+  captured space (no more "black void" starts).
+- Plan purely horizontal camera motion with smooth yaw-only rotations.
+- Use collision-aware grid navigation (A*) plus Catmull–Rom smoothing for
+  graceful travel between anchors.
+- Keep camera height steady at a comfortable eye level, avoiding vertical
+  bounces.
 """
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass, field as dataclass_field
 from typing import List, Optional, Sequence
 
 import numpy as np
+from scipy import ndimage
 
 from .explorer import GaussianScene, ObjectCandidate, SceneExplorer, SceneType
 
@@ -50,7 +55,7 @@ class PlannerSettings:
 
 
 class CameraPathPlanner:
-    """Spline-based cinematic trajectory planner."""
+    """Navigation-field-based cinematic trajectory planner."""
 
     def __init__(
         self,
@@ -72,19 +77,19 @@ class CameraPathPlanner:
         duration: float = 90.0,
         description: str = "exploratory",
     ) -> CameraPath:
+        nav_field = self._build_navigation_field(scene)
+        start = self._choose_start(nav_field)
+        anchor_points = self._project_anchors(nav_field, waypoints)
+        ordered_targets = self._order_targets(start, anchor_points)
+        route = self._stitch_route(nav_field, start, ordered_targets)
+        smooth_route = self._smooth_route(route, samples=int(duration * 2))
         samples = max(2, int(duration * self.settings.fps))
-        base_path = self._build_catmull_rom_path(waypoints, samples * 4)
-        positions = self._reparameterize(base_path, samples)
-        safe_positions = self._ensure_clearance(scene, positions)
-        safe_positions = self._clamp_to_bounds(scene, safe_positions, margin=0.25)
-        grounded_positions = self._apply_grounding(scene, safe_positions)
-        grounded_positions = self._clamp_to_bounds(scene, grounded_positions, margin=0.25)
-        grounded_positions = self._smooth_positions(grounded_positions, window=13)
-        grounded_positions = self._clamp_to_bounds(scene, grounded_positions, margin=0.25)
-        forwards = self._compute_forward_vectors(grounded_positions)
-        forwards = self._smooth_vectors(forwards, window=11)
+        positions = self._reparameterize(smooth_route, samples)
+        positions = self._lift_to_world(nav_field, positions)
+        forwards = self._compute_horizontal_forwards(positions)
+        forwards = self._smooth_vectors(forwards, window=9)
         poses = self._poses_from_vectors(
-            grounded_positions,
+            positions,
             forwards,
             duration,
             bias=scene.scene_type,
@@ -99,55 +104,116 @@ class CameraPathPlanner:
     ) -> CameraPath:
         if not objects:
             raise ValueError("No object candidates provided.")
-        waypoints = []
-        for idx, obj in enumerate(objects):
-            offset_dir = self._sample_unit_sphere()
-            offset_dir[1] = max(0.1, offset_dir[1])
-            distance = 2.0 if scene.scene_type == SceneType.INDOOR else 5.0
-            waypoint = obj.position + offset_dir * distance
-            waypoint[1] = np.clip(
-                waypoint[1],
-                scene.bounds_min[1] + 0.2,
-                scene.bounds_max[1] - 0.2,
+        anchors = []
+        for obj in objects:
+            offset = self._sample_unit_circle() * (
+                1.6 if scene.scene_type == SceneType.INDOOR else 3.5
             )
-            waypoints.append(waypoint)
-            # Insert intermediate anchor for smoother transitions.
-            if idx < len(objects) - 1:
-                mid = (waypoint + objects[idx + 1].position) / 2.0
-                waypoints.append(mid)
-        return self.plan_cinematic_path(
-            scene,
-            waypoints=np.asarray(waypoints, dtype=np.float32),
-            duration=duration,
-            description="object_focus",
-        )
+            anchor = obj.position.copy()
+            anchor[0] += offset[0]
+            anchor[2] += offset[1]
+            anchors.append(anchor)
+        return self.plan_cinematic_path(scene, np.asarray(anchors), duration, "object_focus")
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _build_catmull_rom_path(
-        self, waypoints: np.ndarray, samples: int
+    # --- Navigation field construction -------------------------------------------------
+
+    def _build_navigation_field(self, scene: GaussianScene) -> "NavigationField":
+        density_xz = scene.density_grid.max(axis=1)
+        blurred = ndimage.gaussian_filter(density_xz, sigma=1.2)
+
+        density_threshold = max(0.1, float(np.percentile(blurred, 80)))
+        filled_mask = blurred > 0.02
+        support_limit = max(4, int(scene.density_grid.shape[0] * 0.12))
+        support_distance = ndimage.distance_transform_edt(~filled_mask)
+        support_mask = support_distance <= support_limit
+
+        occupancy = blurred >= density_threshold
+        safety_cells = self._safety_cells(scene.grid_spacing)
+        grown_obstacles = ndimage.binary_dilation(occupancy, iterations=safety_cells)
+        free_mask = support_mask & ~grown_obstacles
+
+        floor_height = float(np.percentile(scene.positions[:, 1], 5))
+        ceiling = float(np.percentile(scene.positions[:, 1], 95))
+        eye_height = np.clip(floor_height + 1.5, floor_height + 0.5, ceiling - 0.3)
+
+        return NavigationField(
+            free_mask=free_mask,
+            support_mask=support_mask,
+            origin=scene.grid_origin,
+            spacing=scene.grid_spacing,
+            eye_height=eye_height,
+        )
+
+    def _safety_cells(self, spacing: np.ndarray) -> int:
+        horizontal_spacing = float(min(spacing[0], spacing[2]))
+        clearance = self.settings.camera_radius + self.settings.min_clearance
+        return max(1, int(math.ceil(clearance / max(horizontal_spacing, 1e-4))))
+
+    def _choose_start(self, nav: "NavigationField") -> np.ndarray:
+        if not np.any(nav.free_mask):
+            center = (np.array(nav.free_mask.shape) // 2).astype(int)
+            return center
+        distance = ndimage.distance_transform_edt(nav.free_mask)
+        idx = np.unravel_index(np.argmax(distance), distance.shape)
+        return np.array(idx, dtype=int)
+
+    def _project_anchors(self, nav: "NavigationField", waypoints: np.ndarray) -> np.ndarray:
+        anchors = []
+        for point in np.asarray(waypoints, dtype=np.float32):
+            cell = self._world_to_cell(nav, point)
+            snapped = self._snap_to_free(nav, cell)
+            anchors.append(snapped)
+        if not anchors:
+            anchors.append(self._choose_start(nav))
+        return np.asarray(anchors, dtype=int)
+
+    def _order_targets(self, start: np.ndarray, anchors: np.ndarray) -> List[np.ndarray]:
+        remaining = anchors.tolist()
+        ordered: List[np.ndarray] = []
+        current = np.array(start, dtype=int)
+        while remaining:
+            distances = [np.linalg.norm(np.array(cell) - current) for cell in remaining]
+            idx = int(np.argmax(distances))
+            current = np.array(remaining.pop(idx), dtype=int)
+            ordered.append(current)
+        return ordered
+
+    def _stitch_route(
+        self, nav: "NavigationField", start: np.ndarray, targets: Sequence[np.ndarray]
     ) -> np.ndarray:
-        points = np.asarray(waypoints, dtype=np.float32)
-        if len(points) < 4:
-            raise ValueError("Need at least 4 waypoints for Catmull-Rom spline.")
-        padded = np.vstack([points[0], points, points[-1]])
-        segments = len(points) - 1
+        cells = [start]
+        current = start
+        for target in targets:
+            path = self._astar(nav.free_mask, current, target)
+            if len(path) == 0:
+                break
+            cells.extend(path[1:])
+            current = target
+        xz_world = [self._cell_to_xz(nav, cell) for cell in cells]
+        return np.asarray(xz_world, dtype=np.float32)
+
+    def _smooth_route(self, route: np.ndarray, samples: int) -> np.ndarray:
+        if len(route) < 4:
+            return self._reparameterize(route, samples)
+        padded = np.vstack([route[0], route, route[-1]])
+        segments = len(route) - 1
         samples_per_segment = max(4, samples // segments)
-        trajectory = []
+        smoothed = []
         for i in range(segments):
             p0, p1, p2, p3 = padded[i : i + 4]
-            for u in np.linspace(0, 1, samples_per_segment, endpoint=False):
-                point = self._catmull_rom(p0, p1, p2, p3, u)
-                trajectory.append(point)
-        trajectory.append(points[-1])
-        return np.asarray(trajectory)
+            for t in np.linspace(0, 1, samples_per_segment, endpoint=False):
+                smoothed.append(self._catmull_rom(p0, p1, p2, p3, t))
+        smoothed.append(route[-1])
+        return np.asarray(smoothed, dtype=np.float32)
+
+    # --- Geometry helpers -------------------------------------------------------------
 
     def _catmull_rom(
         self, p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, t: float
     ) -> np.ndarray:
-        """Standard Catmull-Rom spline interpolation."""
-
         a = 2 * p1
         b = p2 - p0
         c = 2 * p0 - 5 * p1 + 4 * p2 - p3
@@ -157,70 +223,18 @@ class CameraPathPlanner:
         return 0.5 * (a + b * t + c * t2 + d * t3)
 
     def _reparameterize(self, samples: np.ndarray, target_len: int) -> np.ndarray:
+        if len(samples) == 1:
+            return np.repeat(samples, target_len, axis=0)
         distances = np.linalg.norm(np.diff(samples, axis=0), axis=1)
         cumulative = np.concatenate([[0.0], np.cumsum(distances)])
-        total_length = cumulative[-1]
+        total_length = max(cumulative[-1], 1e-6)
         progress = np.linspace(0, 1, target_len)
-        eased = progress * progress * (3 - 2 * progress)  # smoothstep
+        eased = progress * progress * (3 - 2 * progress)
         target_dist = eased * total_length
-        interp = np.empty((target_len, 3), dtype=np.float32)
-        for axis in range(3):
+        interp = np.empty((target_len, samples.shape[1]), dtype=np.float32)
+        for axis in range(samples.shape[1]):
             interp[:, axis] = np.interp(target_dist, cumulative, samples[:, axis])
         return interp
-
-    def _ensure_clearance(
-        self,
-        scene: GaussianScene,
-        positions: np.ndarray,
-    ) -> np.ndarray:
-        safe = positions.copy()
-        for idx, point in enumerate(positions):
-            clearance = self.explorer.estimate_clearance(scene, point)
-            density = self.explorer.sample_density(scene, point)
-            target = self.settings.camera_radius + self.settings.min_clearance + density * 0.5
-            needs_push = clearance + 1e-4 < target or density > 0.25
-            if needs_push:
-                normal = self._estimate_density_gradient(scene, point)
-                if np.linalg.norm(normal) < 1e-3:
-                    normal = self._sample_unit_sphere()
-                normal = normal / np.linalg.norm(normal)
-                push = target - clearance + 1e-2
-                push = max(push, 0.05)
-                safe[idx] = point + normal * push
-            safe[idx] = np.clip(safe[idx], scene.bounds_min + 0.1, scene.bounds_max - 0.1)
-        return safe
-
-    def _clamp_to_bounds(
-        self, scene: GaussianScene, positions: np.ndarray, margin: float = 0.2
-    ) -> np.ndarray:
-        lower = scene.bounds_min + margin
-        upper = scene.bounds_max - margin
-        return np.clip(positions, lower, upper)
-
-    def _apply_grounding(self, scene: GaussianScene, positions: np.ndarray) -> np.ndarray:
-        """
-        Bias camera heights towards a human-held viewpoint and smooth
-        vertical movement to prevent large up/down swings.
-        """
-
-        grounded = positions.copy()
-        floor = float(scene.bounds_min[1]) + 0.2
-        ceiling = float(scene.bounds_max[1]) - 0.2
-        headroom = 1.8 if scene.scene_type == SceneType.INDOOR else 2.3
-        target_top = min(floor + headroom, ceiling)
-        min_height = min(floor + 0.4, target_top)
-        grounded[:, 1] = np.clip(grounded[:, 1], min_height, target_top)
-        grounded[:, 1] = self._smooth_signal(grounded[:, 1], window=19)
-        grounded[:, 1] = np.clip(grounded[:, 1], min_height, target_top)
-        return grounded
-
-    def _smooth_positions(self, positions: np.ndarray, window: int) -> np.ndarray:
-        if window <= 1:
-            return positions
-        smoothed = positions.copy()
-        for axis in range(3):
-            smoothed[:, axis] = self._smooth_signal(positions[:, axis], window)
-        return smoothed
 
     def _smooth_signal(self, values: np.ndarray, window: int) -> np.ndarray:
         if window <= 1:
@@ -230,6 +244,14 @@ class CameraPathPlanner:
         smoothed = np.convolve(padded, kernel, mode="valid")
         return smoothed.astype(np.float32)
 
+    def _smooth_positions(self, positions: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return positions
+        smoothed = positions.copy()
+        for axis in range(positions.shape[1]):
+            smoothed[:, axis] = self._smooth_signal(positions[:, axis], window)
+        return smoothed
+
     def _smooth_vectors(self, vectors: np.ndarray, window: int) -> np.ndarray:
         if window <= 1:
             return vectors
@@ -238,31 +260,86 @@ class CameraPathPlanner:
         norms = np.clip(norms, 1e-6, None)
         return smoothed / norms
 
-    def _estimate_density_gradient(
-        self, scene: GaussianScene, point: np.ndarray, epsilon: float = 0.15
-    ) -> np.ndarray:
-        gradients = []
-        for axis in range(3):
-            offset = np.zeros(3, dtype=np.float32)
-            offset[axis] = epsilon
-            high = self.explorer.sample_density(scene, point + offset)
-            low = self.explorer.sample_density(scene, point - offset)
-            gradients.append((high - low) / (2 * epsilon))
-        return np.asarray(gradients, dtype=np.float32)
+    # --- Coordinate conversions -------------------------------------------------------
 
-    def _compute_forward_vectors(self, positions: np.ndarray) -> np.ndarray:
-        forwards = []
-        for i, pos in enumerate(positions):
-            if i < len(positions) - 1:
-                direction = positions[i + 1] - pos
-            else:
-                direction = pos - positions[i - 1]
-            norm = np.linalg.norm(direction)
-            if norm < 1e-5:
-                direction = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-                norm = 1.0
-            forwards.append(direction / norm)
-        return np.asarray(forwards)
+    def _world_to_cell(self, nav: "NavigationField", point: np.ndarray) -> np.ndarray:
+        rel = (point[[0, 2]] - nav.origin[[0, 2]]) / nav.spacing[[0, 2]]
+        cell = np.round(rel).astype(int)
+        cell = np.clip(cell, 0, np.array(nav.free_mask.shape) - 1)
+        return cell
+
+    def _cell_to_xz(self, nav: "NavigationField", cell: np.ndarray) -> np.ndarray:
+        return nav.origin[[0, 2]] + (np.asarray(cell) + 0.5) * nav.spacing[[0, 2]]
+
+    def _lift_to_world(self, nav: "NavigationField", positions: np.ndarray) -> np.ndarray:
+        lifted = np.zeros((len(positions), 3), dtype=np.float32)
+        lifted[:, 0] = positions[:, 0]
+        lifted[:, 2] = positions[:, 1]
+        lifted[:, 1] = nav.eye_height
+        return lifted
+
+    # --- Grid navigation --------------------------------------------------------------
+
+    def _snap_to_free(self, nav: "NavigationField", cell: np.ndarray) -> np.ndarray:
+        if nav.free_mask[tuple(cell)]:
+            return cell
+        free_cells = np.argwhere(nav.free_mask)
+        if len(free_cells) == 0:
+            return np.clip(cell, 0, np.array(nav.free_mask.shape) - 1)
+        distances = np.linalg.norm(free_cells - cell, axis=1)
+        idx = int(np.argmin(distances))
+        return free_cells[idx]
+
+    def _astar(self, free_mask: np.ndarray, start: np.ndarray, goal: np.ndarray) -> List[np.ndarray]:
+        start_t = tuple(start)
+        goal_t = tuple(goal)
+        if start_t == goal_t:
+            return [start]
+        height, width = free_mask.shape
+        open_set: List[tuple[float, tuple[int, int]]] = []
+        heapq.heappush(open_set, (0.0, start_t))
+        came_from: dict[tuple[int, int], tuple[int, int]] = {}
+        g_score = {start_t: 0.0}
+
+        neighbors = [
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
+        ]
+
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            if current == goal_t:
+                return self._reconstruct_path(came_from, current)
+            for dx, dz in neighbors:
+                nx, nz = current[0] + dx, current[1] + dz
+                if nx < 0 or nz < 0 or nx >= height or nz >= width:
+                    continue
+                if not free_mask[nx, nz]:
+                    continue
+                tentative = g_score[current] + math.hypot(dx, dz)
+                neighbor = (nx, nz)
+                if tentative < g_score.get(neighbor, float("inf")):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative
+                    f_score = tentative + math.hypot(goal_t[0] - nx, goal_t[1] - nz)
+                    heapq.heappush(open_set, (f_score, neighbor))
+        return []
+
+    def _reconstruct_path(
+        self, came_from: dict[tuple[int, int], tuple[int, int]], current: tuple[int, int]
+    ) -> List[np.ndarray]:
+        path = [np.array(current, dtype=int)]
+        while current in came_from:
+            current = came_from[current]
+            path.append(np.array(current, dtype=int))
+        path.reverse()
+        return path
 
     def _poses_from_vectors(
         self,
@@ -273,42 +350,46 @@ class CameraPathPlanner:
     ) -> List[CameraPose]:
         times = np.linspace(0, duration, len(positions))
         poses = []
-        roll_bias = 0.0 if bias == SceneType.INDOOR else 0.05
         for idx, (pos, fwd) in enumerate(zip(positions, forwards)):
-            up = self.settings.up_vector.copy()
-            if bias == SceneType.OUTDOOR:
-                up = self._blend_vectors(up, np.array([0.0, 0.8, 0.2]))
-            if roll_bias != 0.0:
-                up = self._apply_roll(up, fwd, roll_bias * math.sin(idx / 20.0))
             poses.append(
                 CameraPose(
                     position=pos,
                     forward=fwd,
-                    up=up / np.linalg.norm(up),
+                    up=self.settings.up_vector,
                     timestamp=float(times[idx]),
-                    fov=60.0 if bias == SceneType.OUTDOOR else 50.0,
+                    fov=55.0,
                 )
             )
         return poses
 
-    def _apply_roll(self, up: np.ndarray, forward: np.ndarray, angle: float) -> np.ndarray:
-        axis = forward / np.linalg.norm(forward)
-        sin = math.sin(angle)
-        cos = math.cos(angle)
-        return (
-            up * cos
-            + np.cross(axis, up) * sin
-            + axis * np.dot(axis, up) * (1 - cos)
-        )
+    def _compute_horizontal_forwards(self, positions: np.ndarray) -> np.ndarray:
+        forwards = []
+        for i, pos in enumerate(positions):
+            if i < len(positions) - 1:
+                direction = positions[i + 1] - pos
+            else:
+                direction = pos - positions[i - 1]
+            direction[1] = 0.0
+            norm = np.linalg.norm(direction[[0, 2]])
+            if norm < 1e-5:
+                direction = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                direction = direction / norm
+            forwards.append(direction)
+        return np.asarray(forwards, dtype=np.float32)
 
-    def _blend_vectors(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        vec = 0.7 * a + 0.3 * b
-        return vec / np.linalg.norm(vec)
+    def _sample_unit_circle(self) -> np.ndarray:
+        angle = float(self.rng.uniform(0, 2 * math.pi))
+        return np.array([math.cos(angle), math.sin(angle)], dtype=np.float32)
 
-    def _sample_unit_sphere(self) -> np.ndarray:
-        vec = self.rng.normal(size=3)
-        vec[1] = abs(vec[1])
-        return vec / np.linalg.norm(vec)
+
+@dataclass
+class NavigationField:
+    free_mask: np.ndarray
+    support_mask: np.ndarray
+    origin: np.ndarray
+    spacing: np.ndarray
+    eye_height: float
 
 
 __all__ = ["CameraPathPlanner", "CameraPose", "CameraPath", "PlannerSettings"]
