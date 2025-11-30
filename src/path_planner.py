@@ -182,12 +182,19 @@ class CameraPathPlanner:
         return smoothed
 
     def _forward_vectors(self, positions: np.ndarray) -> np.ndarray:
+        """Derive stable forward directions, reusing last valid when steps are tiny."""
         diffs = np.diff(positions, axis=0, prepend=positions[[0]])
         diffs[0] = diffs[1]
         diffs[:, 1] = 0.0  # keep horizontal forward motion
-        norms = np.linalg.norm(diffs, axis=1, keepdims=True)
-        norms = np.clip(norms, 1e-5, None)
-        return (diffs / norms).astype(np.float32)
+
+        forwards = np.zeros_like(diffs, dtype=np.float32)
+        last_dir = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        for i, diff in enumerate(diffs):
+            norm = np.linalg.norm(diff)
+            if norm > 1e-4 and np.isfinite(norm):
+                last_dir = (diff / norm).astype(np.float32)
+            forwards[i] = last_dir
+        return forwards
 
 
 __all__ = ["CameraPathPlanner", "CameraPose", "CameraPath", "PlannerSettings"]

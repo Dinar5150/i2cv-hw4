@@ -10,7 +10,7 @@ from typing import Tuple
 
 import numpy as np
 
-from .explorer import SceneExplorer
+from .explorer import SceneExplorer, SceneType
 from .path_planner import CameraPathPlanner
 from .renderer import GaussianRenderer
 
@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
         default="1280x720",
         help="Video resolution WIDTHxHEIGHT (e.g., 1920x1080).",
     )
+    parser.add_argument(
+        "--scene-type",
+        choices=["auto", "indoor", "outdoor"],
+        default="auto",
+        help="Force indoor/outdoor heuristics instead of auto-detecting.",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +61,10 @@ def main() -> None:
     planner = CameraPathPlanner()
     renderer = GaussianRenderer(backend=args.backend)
 
+    declared_type = None
+    if args.scene_type != "auto":
+        declared_type = SceneType(args.scene_type)
+
     for scene_path in args.scenes:
         run_scene(
             Path(scene_path),
@@ -63,6 +73,7 @@ def main() -> None:
             renderer=renderer,
             output_dir=args.output_dir,
             resolution=args.resolution,
+            declared_type=declared_type,
         )
 
 
@@ -73,9 +84,10 @@ def run_scene(
     renderer: GaussianRenderer,
     output_dir: Path,
     resolution: Tuple[int, int],
+    declared_type: SceneType | None = None,
 ) -> None:
     print(f"\n=== Processing scene: {scene_path} ===")
-    scene = explorer.load_scene(scene_path)
+    scene = explorer.load_scene(scene_path, declared_type=declared_type)
     path = planner.plan_cinematic_path(scene)
     print(
         f"Prepared forward-only cinematic path with {len(path.poses)} poses "

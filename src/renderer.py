@@ -280,6 +280,20 @@ class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runt
         position = torch.tensor(pose.position, device=self.device, dtype=torch.float32)
         forward = torch.tensor(pose.forward, device=self.device, dtype=torch.float32)
         up = torch.tensor(pose.up, device=self.device, dtype=torch.float32)
+
+        # Guard against degenerate/collinear bases to keep view invertible.
+        if not torch.isfinite(forward).all() or torch.linalg.norm(forward) < 1e-6:
+            forward = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        forward = torch.nn.functional.normalize(forward, dim=0)
+
+        if not torch.isfinite(up).all() or torch.linalg.norm(up) < 1e-6:
+            up = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+        up = torch.nn.functional.normalize(up, dim=0)
+        if torch.abs(torch.dot(forward, up)) > 0.995:
+            up = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+            if torch.abs(torch.dot(forward, up)) > 0.995:
+                up = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+
         right = torch.linalg.cross(forward, up)
         right = torch.nn.functional.normalize(right, dim=0)
         up_vec = torch.linalg.cross(right, forward)
