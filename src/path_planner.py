@@ -21,10 +21,16 @@ def _smoothstep(x: np.ndarray) -> np.ndarray:
 
 def _look_at_rotation(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     forward = target - eye
-    forward_norm = np.linalg.norm(forward) + 1e-8
+    forward_norm = np.linalg.norm(forward)
+    if forward_norm < 1e-6:
+        forward = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        forward_norm = 1.0
     forward = forward / forward_norm
     right = np.cross(forward, up)
-    right_norm = np.linalg.norm(right) + 1e-8
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-6:
+        right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        right_norm = 1.0
     right = right / right_norm
     true_up = np.cross(right, forward)
     rot = np.stack([right, true_up, -forward], axis=1)

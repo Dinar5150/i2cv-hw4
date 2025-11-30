@@ -38,6 +38,13 @@ def generate_exploration_waypoints(
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     waypoints: List[Waypoint] = []
 
+    # Start at the origin; if that coincides with the look target, nudge forward.
+    start_pos = np.zeros(3, dtype=np.float32)
+    start_look = center.copy()
+    if np.linalg.norm(start_pos - start_look) < 1e-4:
+        start_look = start_pos + np.array([0.0, 0.0, max(stats.radius, 1.0)], dtype=np.float32)
+    waypoints.append(Waypoint(position=start_pos, look_at=start_look))
+
     for orbit_id in range(num_orbits):
         radius = base_radius * (1.0 - 0.12 * orbit_id)
         height = stats.radius * (0.15 + 0.1 * orbit_id)

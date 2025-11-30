@@ -44,17 +44,26 @@ def _first_existing(mapping, keys, default=None):
 
 
 def _load_with_gsplat(ply_path: Path):
-    try:
-        from gsplat.io import load_ply
-    except Exception:
+    import importlib
+
+    candidates = [
+        ("gsplat.io", "load_ply"),
+        ("gsplat.io.utils", "load_ply"),
+        ("gsplat.io.ply", "load_ply"),
+    ]
+    last_err = None
+    for mod_name, attr in candidates:
         try:
-            from gsplat.io.utils import load_ply  # type: ignore
-        except Exception as exc:  # pragma: no cover - import is environment specific
-            raise ImportError(
-                "gsplat is required to load the Gaussian splat PLY. "
-                "Install with `pip install gsplat` or from source."
-            ) from exc
-    return load_ply(str(ply_path))
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, attr):
+                return getattr(mod, attr)(str(ply_path))
+        except Exception as exc:  # pragma: no cover - environment specific
+            last_err = exc
+            continue
+    raise ImportError(
+        "gsplat is required to load the Gaussian splat PLY. "
+        "Install with `pip install gsplat` or from source."
+    ) from last_err
 
 
 def _fallback_load_ply(ply_path: Path):

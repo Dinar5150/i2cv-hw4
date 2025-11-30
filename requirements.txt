@@ -2,6 +2,6 @@ numpy
 scipy
 tqdm
 imageio[ffmpeg]
-gsplat
-torch
 plyfile
+gsplat @ git+https://github.com/nerfstudio-project/gsplat.git
+torch

@@ -52,17 +52,47 @@ def _sh_degree(shs: Optional[torch.Tensor]) -> int:
 
 
 def _get_raster_components():
-    try:
-        from gsplat.render import GSplatRasterizationSettings as Settings
-    except Exception:
+    import importlib
+
+    settings_candidates = [
+        ("gsplat.render", "GSplatRasterizationSettings"),
+        ("gsplat.render", "RasterizationSettings"),
+        ("gsplat.render", "GaussianRasterizationSettings"),
+        ("gsplat.cuda", "GSplatRasterizationSettings"),
+        ("gsplat.cuda", "RasterizationSettings"),
+        ("gsplat.cuda", "GaussianRasterizationSettings"),
+        ("gsplat.cuda._C", "GSplatRasterizationSettings"),
+        ("gsplat.cuda._C", "RasterizationSettings"),
+        ("gsplat.cuda._C", "GaussianRasterizationSettings"),
+    ]
+    raster_candidates = [
+        ("gsplat.render", "rasterization"),
+        ("gsplat.cuda", "rasterization"),
+        ("gsplat.cuda._C", "rasterization"),
+        ("gsplat.cuda._C", "rasterize"),
+    ]
+
+    Settings = None
+    rasterization = None
+
+    for mod_name, attr in settings_candidates:
         try:
-            from gsplat.render import RasterizationSettings as Settings
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, attr):
+                Settings = getattr(mod, attr)
+                break
         except Exception:
-            Settings = None
-    try:
-        from gsplat.render import rasterization
-    except Exception:
-        rasterization = None
+            continue
+
+    for mod_name, attr in raster_candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, attr):
+                rasterization = getattr(mod, attr)
+                break
+        except Exception:
+            continue
+
     return Settings, rasterization
 
 
