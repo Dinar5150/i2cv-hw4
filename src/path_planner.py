@@ -105,9 +105,13 @@ class CameraPathPlanner:
         margin = max(scene.diagonal_length * self.settings.margin_ratio, 0.35)
         lower = np.percentile(scene.positions, 5, axis=0)
         upper = np.percentile(scene.positions, 95, axis=0)
-        safe_min = np.minimum(lower + margin, scene.bounds_max)
-        safe_max = np.maximum(upper - margin, scene.bounds_min)
-        safe_min = np.minimum(safe_min, safe_max - 1e-3)
+        safe_min = np.maximum(lower + margin, scene.bounds_min)
+        safe_max = np.minimum(upper - margin, scene.bounds_max)
+        if np.any(safe_max <= safe_min):
+            center = (scene.bounds_min + scene.bounds_max) / 2.0
+            epsilon = 1e-3
+            safe_min = np.minimum(center - epsilon, center)
+            safe_max = np.maximum(center + epsilon, center)
         return safe_min.astype(np.float32), safe_max.astype(np.float32)
 
     def _principal_direction(self, scene: GaussianScene) -> np.ndarray:
@@ -154,8 +158,18 @@ class CameraPathPlanner:
     def _eye_height(
         self, scene: GaussianScene, safe_min: np.ndarray, safe_max: np.ndarray
     ) -> float:
-        height = float(np.percentile(scene.positions[:, 1], 35))
-        return float(np.clip(height, safe_min[1] + 0.2, safe_max[1] - 0.2))
+        center = (scene.bounds_min + scene.bounds_max) / 2.0
+        span = scene.bounds_max - scene.bounds_min
+        xz_mask = (
+            np.abs(scene.positions[:, 0] - center[0]) <= 0.35 * span[0]
+        ) & (
+            np.abs(scene.positions[:, 2] - center[2]) <= 0.35 * span[2]
+        )
+        band = scene.positions[xz_mask][:, 1] if np.any(xz_mask) else scene.positions[:, 1]
+        floor = float(np.percentile(band, 10))
+        mid = float(np.percentile(band, 70))
+        height = floor + 0.25 * max(mid - floor, 0.0)
+        return float(np.clip(height, safe_min[1] + 0.15, safe_max[1] - 0.35))
 
     def _smooth_positions(self, positions: np.ndarray, window: int) -> np.ndarray:
         if window <= 1:
