@@ -52,32 +52,23 @@ def _sh_degree(shs: Optional[torch.Tensor]) -> int:
 
 
 def _get_raster_components():
+    """
+    Resolve the gsplat rasterization entrypoints, preferring the current CUDA API.
+    """
     import importlib
 
     settings_candidates = [
-        ("gsplat.render", "GSplatRasterizationSettings"),
-        ("gsplat.render", "RasterizationSettings"),
+        ("gsplat.cuda.rasterization", "GSplatRasterizationSettings"),
+        ("gsplat.cuda.rasterization", "GaussianRasterizationSettings"),
+        ("gsplat.render", "GSplatRasterizationSettings"),  # legacy
         ("gsplat.render", "GaussianRasterizationSettings"),
-        ("gsplat.cuda", "GSplatRasterizationSettings"),
-        ("gsplat.cuda", "RasterizationSettings"),
-        ("gsplat.cuda", "GaussianRasterizationSettings"),
-        ("gsplat.cuda._C", "GSplatRasterizationSettings"),
-        ("gsplat.cuda._C", "RasterizationSettings"),
-        ("gsplat.cuda._C", "GaussianRasterizationSettings"),
+        ("gsplat.render", "RasterizationSettings"),
     ]
     raster_candidates = [
+        ("gsplat.cuda.rasterization", "rasterization"),
+        ("gsplat.cuda.rasterization", "gaussian_rasterization"),
         ("gsplat.render", "rasterization"),
-        ("gsplat.render", "rasterize"),
         ("gsplat.render", "gaussian_rasterization"),
-        ("gsplat.render", "gaussian_rasterize"),
-        ("gsplat.cuda", "rasterization"),
-        ("gsplat.cuda", "rasterize"),
-        ("gsplat.cuda", "gaussian_rasterization"),
-        ("gsplat.cuda", "gaussian_rasterize"),
-        ("gsplat.cuda._C", "rasterization"),
-        ("gsplat.cuda._C", "rasterize"),
-        ("gsplat.cuda._C", "gaussian_rasterization"),
-        ("gsplat.cuda._C", "gaussian_rasterize"),
     ]
 
     Settings = None

@@ -44,10 +44,14 @@ def _first_existing(mapping, keys, default=None):
 
 
 def _load_with_gsplat(ply_path: Path):
+    """
+    Use the current gsplat CUDA loader (gsplat >= 1.5) and fall back to legacy paths.
+    """
     import importlib
 
     candidates = [
-        ("gsplat.io", "load_ply"),
+        ("gsplat.cuda.io", "load_ply"),  # new API
+        ("gsplat.io", "load_ply"),  # legacy
         ("gsplat.io.utils", "load_ply"),
         ("gsplat.io.ply", "load_ply"),
         ("gsplat", "load_ply"),
