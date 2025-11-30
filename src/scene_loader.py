@@ -50,6 +50,7 @@ def _load_with_gsplat(ply_path: Path):
         ("gsplat.io", "load_ply"),
         ("gsplat.io.utils", "load_ply"),
         ("gsplat.io.ply", "load_ply"),
+        ("gsplat", "load_ply"),
     ]
     last_err = None
     for mod_name, attr in candidates:
@@ -60,6 +61,7 @@ def _load_with_gsplat(ply_path: Path):
         except Exception as exc:  # pragma: no cover - environment specific
             last_err = exc
             continue
+    logging.error("gsplat load_ply not found or failed: %s", last_err)
     raise ImportError(
         "gsplat is required to load the Gaussian splat PLY. "
         "Install with `pip install gsplat` or from source."

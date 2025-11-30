@@ -67,13 +67,22 @@ def _get_raster_components():
     ]
     raster_candidates = [
         ("gsplat.render", "rasterization"),
+        ("gsplat.render", "rasterize"),
+        ("gsplat.render", "gaussian_rasterization"),
+        ("gsplat.render", "gaussian_rasterize"),
         ("gsplat.cuda", "rasterization"),
+        ("gsplat.cuda", "rasterize"),
+        ("gsplat.cuda", "gaussian_rasterization"),
+        ("gsplat.cuda", "gaussian_rasterize"),
         ("gsplat.cuda._C", "rasterization"),
         ("gsplat.cuda._C", "rasterize"),
+        ("gsplat.cuda._C", "gaussian_rasterization"),
+        ("gsplat.cuda._C", "gaussian_rasterize"),
     ]
 
     Settings = None
     rasterization = None
+    errors = []
 
     for mod_name, attr in settings_candidates:
         try:
@@ -81,8 +90,8 @@ def _get_raster_components():
             if hasattr(mod, attr):
                 Settings = getattr(mod, attr)
                 break
-        except Exception:
-            continue
+        except Exception as exc:
+            errors.append((mod_name, attr, str(exc)))
 
     for mod_name, attr in raster_candidates:
         try:
@@ -90,9 +99,11 @@ def _get_raster_components():
             if hasattr(mod, attr):
                 rasterization = getattr(mod, attr)
                 break
-        except Exception:
-            continue
+        except Exception as exc:
+            errors.append((mod_name, attr, str(exc)))
 
+    if Settings is None or rasterization is None:
+        logging.error("gsplat raster components not found; attempts: %s", errors)
     return Settings, rasterization
 
 
