@@ -47,6 +47,9 @@ class PlannerSettings:
     duration: float = 75.0
     margin_ratio: float = 0.08
     lateral_ratio: float = 0.12
+    min_travel_distance: float = 2.5
+    min_extent: float = 1.0
+    min_clearance: float = 0.35
     up_vector: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 1.0, 0.0], dtype=np.float32)
     )
@@ -80,6 +83,8 @@ class CameraPathPlanner:
             positions.append(pos)
         positions = np.asarray(positions, dtype=np.float32)
         positions = self._smooth_positions(positions, window=7)
+        positions = self._apply_clearance(scene, positions)
+        positions = self._smooth_positions(positions, window=5)
 
         forwards = self._forward_vectors(positions)
         poses = [
@@ -109,9 +114,16 @@ class CameraPathPlanner:
         safe_max = np.minimum(upper - margin, scene.bounds_max)
         if np.any(safe_max <= safe_min):
             center = (scene.bounds_min + scene.bounds_max) / 2.0
-            epsilon = 1e-3
-            safe_min = np.minimum(center - epsilon, center)
-            safe_max = np.maximum(center + epsilon, center)
+            fallback_extent = max(
+                self.settings.min_extent, 0.08 * scene.diagonal_length, 0.5
+            )
+            half = fallback_extent * 0.5
+            safe_min = np.maximum(center - half, scene.bounds_min)
+            safe_max = np.minimum(center + half, scene.bounds_max)
+            if np.any(safe_max <= safe_min):
+                epsilon = max(scene.diagonal_length * 0.01, 0.1)
+                safe_min = center - epsilon
+                safe_max = center + epsilon
         return safe_min.astype(np.float32), safe_max.astype(np.float32)
 
     def _principal_direction(self, scene: GaussianScene) -> np.ndarray:
@@ -143,7 +155,7 @@ class CameraPathPlanner:
         projections = [float(np.dot(corner, direction)) for corner in corners]
         proj_min, proj_max = min(projections), max(projections)
         span = proj_max - proj_min
-        travel_extent = span * 0.9
+        travel_extent = max(span * 0.9, self.settings.min_travel_distance)
         start_offset = proj_min + (span - travel_extent) / 2.0 - np.dot(
             (safe_min + safe_max) / 2.0, direction
         )
@@ -195,6 +207,23 @@ class CameraPathPlanner:
                 last_dir = (diff / norm).astype(np.float32)
             forwards[i] = last_dir
         return forwards
+
+    def _apply_clearance(self, scene: GaussianScene, positions: np.ndarray) -> np.ndarray:
+        """Push poses away from dense splats to avoid collisions."""
+        positions = positions.copy()
+        for _ in range(3):  # iterative relax to escape walls
+            distances, idx = scene.kd_tree.query(positions, k=1)
+            too_close = distances < self.settings.min_clearance
+            if not np.any(too_close):
+                break
+            nearest = scene.positions[idx[too_close]]
+            direction = positions[too_close] - nearest
+            norms = np.linalg.norm(direction, axis=1, keepdims=True)
+            direction = direction / np.clip(norms, 1e-3, None)
+            offsets = (self.settings.min_clearance - distances[too_close])[:, None] * direction
+            positions[too_close] += offsets
+            positions = np.clip(positions, scene.bounds_min, scene.bounds_max)
+        return positions
 
 
 __all__ = ["CameraPathPlanner", "CameraPose", "CameraPath", "PlannerSettings"]

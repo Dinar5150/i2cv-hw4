@@ -527,9 +527,11 @@ class SceneExplorer:
         grid_spacing[grid_spacing == 0] = 1e-3
         normed = (positions - bounds_min) / grid_spacing
         idx = np.clip(normed.astype(int), 0, self.grid_resolution - 1)
-        for i, j, k in idx:
-            grid[i, j, k] += 1.0
-        grid = grid / np.max(grid)
+        # Vectorized accumulation for speed on large point clouds.
+        np.add.at(grid, (idx[:, 0], idx[:, 1], idx[:, 2]), 1.0)
+        max_val = np.max(grid)
+        if max_val > 0:
+            grid = grid / max_val
         return grid, bounds_min, grid_spacing
 
     def _extract_object_candidates(
