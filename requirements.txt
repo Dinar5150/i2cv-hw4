@@ -2,7 +2,6 @@ numpy
 scipy
 tqdm
 imageio[ffmpeg]
-# Core renderer; install from source for best results
-gsplat @ git+https://github.com/nerfstudio-project/gsplat.git
+gsplat
 torch
 plyfile
