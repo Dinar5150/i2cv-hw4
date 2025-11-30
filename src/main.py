@@ -1,116 +1,98 @@
-"""
-CLI entry point for cinematic navigation across Gaussian Splatting scenes.
-"""
-
-from __future__ import annotations
-
 import argparse
+import logging
 from pathlib import Path
 from typing import Tuple
 
-import numpy as np
+import torch
 
-from .explorer import SceneExplorer, SceneType
-from .path_planner import CameraPathPlanner
-from .renderer import GaussianRenderer
-
-
-def parse_resolution(value: str) -> Tuple[int, int]:
-    width, height = value.lower().split("x")
-    return int(width), int(height)
+from .explorer import generate_exploration_waypoints
+from .path_planner import smooth_camera_path
+from .renderer import RenderConfig, render_video_frames, save_video
+from .scene_loader import load_scene
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Gaussian Splatting cinematic pipeline.")
-    parser.add_argument(
-        "--scenes",
-        nargs="+",
-        required=True,
-        help="List of .ply files to process.",
+def _parse_resolution(res: str) -> Tuple[int, int]:
+    try:
+        width, height = res.lower().split("x")
+        return int(width), int(height)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"Resolution must be WIDTHxHEIGHT, got {res}") from exc
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Cinematic fly-through generator for a single Gaussian Splatting scene.",
     )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs"),
-        help="Directory where frames and mp4 videos will be written.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "gsplat", "lite"],
-        default="auto",
-        help="Rendering backend preference.",
-    )
+    parser.add_argument("--scene", required=True, help="Path to the Gaussian splat .ply file.")
+    parser.add_argument("--output", default=None, help="Path to the output MP4. Defaults to outputs/<scene>/tour.mp4")
     parser.add_argument(
         "--resolution",
-        type=parse_resolution,
-        default="1280x720",
-        help="Video resolution WIDTHxHEIGHT (e.g., 1920x1080).",
+        type=_parse_resolution,
+        default=_parse_resolution("1920x1080"),
+        help="Output resolution WIDTHxHEIGHT.",
     )
-    parser.add_argument(
-        "--scene-type",
-        choices=["auto", "indoor", "outdoor"],
-        default="auto",
-        help="Force indoor/outdoor heuristics instead of auto-detecting.",
+    parser.add_argument("--fps", type=int, default=24, help="Video frame rate.")
+    parser.add_argument("--fov", type=float, default=60.0, help="Camera vertical field of view in degrees.")
+    parser.add_argument("--speed", type=float, default=0.8, help="Nominal camera travel speed in scene units per second.")
+    parser.add_argument("--device", default=None, help="Torch device to render on (e.g., cuda:0 or cpu).")
+    parser.add_argument("--no-normalize", action="store_true", help="Disable scene centering/scaling.")
+    parser.add_argument("--target-radius", type=float, default=1.5, help="Target radius after normalization.")
+    parser.add_argument("--orbits", type=int, default=2, help="Number of wide orbits to seed the path.")
+    parser.add_argument("--orbit-points", type=int, default=60, help="Samples per orbit.")
+    parser.add_argument("--hold", type=float, default=0.6, help="Hold duration (seconds) at start/end.")
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    width, height = args.resolution
+    device = torch.device(args.device) if args.device else None
+
+    logging.info("Loading scene: %s", args.scene)
+    scene, stats, _ = load_scene(
+        args.scene,
+        device=device,
+        normalize=not args.no_normalize,
+        target_radius=args.target_radius,
     )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    explorer = SceneExplorer()
-    planner = CameraPathPlanner()
-    renderer = GaussianRenderer(backend=args.backend)
-
-    declared_type = None
-    if args.scene_type != "auto":
-        declared_type = SceneType(args.scene_type)
-
-    for scene_path in args.scenes:
-        run_scene(
-            Path(scene_path),
-            explorer=explorer,
-            planner=planner,
-            renderer=renderer,
-            output_dir=args.output_dir,
-            resolution=args.resolution,
-            declared_type=declared_type,
-        )
-
-
-def run_scene(
-    scene_path: Path,
-    explorer: SceneExplorer,
-    planner: CameraPathPlanner,
-    renderer: GaussianRenderer,
-    output_dir: Path,
-    resolution: Tuple[int, int],
-    declared_type: SceneType | None = None,
-) -> None:
-    print(f"\n=== Processing scene: {scene_path} ===")
-    scene = explorer.load_scene(scene_path, declared_type=declared_type)
-    path = planner.plan_cinematic_path(scene)
-    print(
-        f"Prepared forward-only cinematic path with {len(path.poses)} poses "
-        f"inside the {scene.scene_type.value} scene bounds."
+    logging.info(
+        "Scene stats | center: (%.3f, %.3f, %.3f) | radius: %.3f | scale: %.3f",
+        stats.center[0],
+        stats.center[1],
+        stats.center[2],
+        stats.radius,
+        stats.scale,
     )
-    base_dir = output_dir / scene.name
-    base_dir.mkdir(parents=True, exist_ok=True)
 
-    frames = renderer.render_path(
-        scene,
-        path,
-        resolution=resolution,
-        progress_hook=lambda done, total: print(
-            f"\rRendering exploratory tour {done}/{total}", end=""
-        ),
+    logging.info("Generating exploration waypoints...")
+    waypoints = generate_exploration_waypoints(
+        stats,
+        num_orbits=args.orbits,
+        points_per_orbit=args.orbit_points,
     )
-    print("\nRendering completed. Writing mp4...")
-    video_path = renderer.save_video(
-        frames,
-        base_dir / f"{scene.name}_{path.description}.mp4",
-        fps=planner.settings.fps,
+
+    logging.info("Smoothing camera path...")
+    poses = smooth_camera_path(
+        waypoints,
+        fps=args.fps,
+        nominal_speed=args.speed,
+        fov=args.fov,
+        hold_seconds=args.hold,
     )
-    print(f"Exploratory video saved to {video_path}")
+    logging.info("Camera poses: %d frames", len(poses))
+
+    config = RenderConfig(width=width, height=height, fps=args.fps, fov=args.fov)
+    logging.info("Rendering frames at %dx%d...", width, height)
+    frames = render_video_frames(scene, stats, poses, config)
+
+    scene_name = Path(args.scene).stem
+    output_path = Path(args.output) if args.output else Path("outputs") / scene_name / "panorama_tour.mp4"
+    logging.info("Writing video to %s", output_path)
+    save_video(frames, output_path, fps=args.fps)
+    logging.info("Done.")
 
 
 if __name__ == "__main__":

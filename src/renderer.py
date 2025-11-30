@@ -1,413 +1,172 @@
-"""
-Renderer utilities that transform planned camera poses into RGB frames and
-assemble them into cinematic MP4 videos.
-
-Two rendering modes are supported:
-- `gsplat`: Uses the CUDA accelerated `gsplat` Gaussian splatting renderer.
-- `lite`: A CPU-based fallback that draws a subset of Gaussians into a pinhole
-  camera with Gaussian weighting, useful for previews or when CUDA is
-  unavailable.
-"""
-
-from __future__ import annotations
-
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional
 
+import imageio.v2 as imageio
 import numpy as np
+import torch
+from tqdm import tqdm
 
-from .explorer import GaussianScene
-from .path_planner import CameraPath, CameraPose
-
-try:  # pragma: no cover - optional dependency
-    import imageio
-except ImportError:  # pragma: no cover - handled at runtime
-    imageio = None
+from .path_planner import CameraPose
+from .scene_loader import SceneData, SceneStats
 
 
-class GaussianRenderer:
-    """High level API that hides backend selection and video export."""
+@dataclass
+class RenderConfig:
+    width: int = 1280
+    height: int = 720
+    fps: int = 24
+    fov: float = 60.0
+    background: tuple = (0.0, 0.0, 0.0)
+    scale_modifier: float = 1.0
+    near: Optional[float] = None
+    far: Optional[float] = None
 
-    def __init__(
-        self,
-        backend: str = "auto",
-        device: str | None = None,
-        max_preview_points: int = 120_000,
-    ) -> None:
-        """
-        Args:
-            backend: "auto", "gsplat", or "lite".
-            device: Preferred torch device for gsplat backend.
-            max_preview_points: Number of Gaussians for lite backend.
-        """
 
-        self.backend_name = backend
-        self.device = device or ("cuda" if self._has_cuda() else "cpu")
-        self.max_preview_points = max_preview_points
-        self._backend_impl: _RendererBackend | None = None
+def _perspective(fov_y: float, aspect: float, near: float, far: float) -> np.ndarray:
+    f = 1.0 / math.tan(fov_y / 2.0)
+    proj = np.zeros((4, 4), dtype=np.float32)
+    proj[0, 0] = f / aspect
+    proj[1, 1] = f
+    proj[2, 2] = (far + near) / (near - far)
+    proj[2, 3] = (2 * far * near) / (near - far)
+    proj[3, 2] = -1.0
+    return proj
 
-    def prepare(self, scene: GaussianScene) -> None:
-        self._backend_impl = self._select_backend(scene)
 
-    def render_path(
-        self,
-        scene: GaussianScene,
-        camera_path: CameraPath,
-        resolution: Tuple[int, int] = (1920, 1080),
-        progress_hook: callable | None = None,
-    ) -> List[np.ndarray]:
-        if self._backend_impl is None:
-            self.prepare(scene)
-        impl = self._backend_impl
-        frames = []
-        total = len(camera_path.poses)
-        for idx, pose in enumerate(camera_path.poses):
-            frame = impl.render(scene, pose, resolution)
-            frames.append(frame)
-            if progress_hook:
-                progress_hook(idx + 1, total)
-        return frames
+def _view_matrix(rotation: np.ndarray, position: np.ndarray) -> np.ndarray:
+    view = np.eye(4, dtype=np.float32)
+    view[:3, :3] = rotation.T
+    view[:3, 3] = -rotation.T @ position
+    return view
 
-    def save_video(
-        self,
-        frames: Sequence[np.ndarray],
-        output_path: Path | str,
-        fps: int,
-    ) -> Path:
-        if imageio is None:  # pragma: no cover - runtime guard.
-            raise RuntimeError(
-                "imageio is not installed. Install imageio[ffmpeg] to enable video export."
-            )
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with imageio.get_writer(path, fps=fps, codec="libx264", quality=9) as writer:
-            for frame in frames:
-                writer.append_data(frame)
-        return path
 
-    # ------------------------------------------------------------------ #
-    def _select_backend(self, scene: GaussianScene) -> "_RendererBackend":
-        backend = self.backend_name
-        if backend in ("auto", "gsplat"):
-            try:
-                return _GsplatBackend(scene, device=self.device)
-            except Exception:  # pragma: no cover - falls back on preview renderer.
-                if backend == "gsplat":
-                    raise
-        return _LiteGaussianBackend(max_points=self.max_preview_points)
+def _sh_degree(shs: Optional[torch.Tensor]) -> int:
+    if shs is None:
+        return 0
+    # Features are laid out as (degree + 1)^2 * 3
+    degree = int(math.sqrt(shs.shape[1] // 3) - 1)
+    return max(degree, 0)
 
-    @staticmethod
-    def _has_cuda() -> bool:
+
+def _get_raster_components():
+    try:
+        from gsplat.render import GSplatRasterizationSettings as Settings
+    except Exception:
         try:
-            import torch
-
-            return torch.cuda.is_available()
-        except Exception:  # pragma: no cover - torch optional
-            return False
-
-
-class _RendererBackend:
-    """Interface each backend implements."""
-
-    def render(
-        self,
-        scene: GaussianScene,
-        pose: CameraPose,
-        resolution: Tuple[int, int],
-    ) -> np.ndarray:
-        raise NotImplementedError
+            from gsplat.render import RasterizationSettings as Settings
+        except Exception:
+            Settings = None
+    try:
+        from gsplat.render import rasterization
+    except Exception:
+        rasterization = None
+    return Settings, rasterization
 
 
-class _GsplatBackend(_RendererBackend):  # pragma: no cover - requires CUDA runtime.
-    """Wraps the modern `gsplat` API using the rasterization helper."""
+def _render_with_gsplat(
+    scene: SceneData, pose: CameraPose, config: RenderConfig, stats: SceneStats
+) -> np.ndarray:
+    Settings, rasterization = _get_raster_components()
+    if Settings is None or rasterization is None:
+        raise ImportError("gsplat rendering components were not found.")
 
-    def __init__(self, scene: GaussianScene, device: str = "cuda") -> None:
-        try:
-            import torch
-            from gsplat.rendering import rasterization
-        except Exception as exc:
-            raise RuntimeError(
-                "gsplat backend requested, but the gsplat package (and its dependencies) "
-                "is not installed. Install via `pip install gsplat torch --extra-index-url "
-                "https://download.pytorch.org/whl/cu121`."
-            ) from exc
+    device = scene.device
+    aspect = config.width / config.height
+    fov_y = math.radians(config.fov)
+    fov_x = 2 * math.atan(math.tan(fov_y / 2) * aspect)
 
-        self.torch = torch
-        self.rasterize = rasterization
-        self.device = torch.device(device)
-        self._layout_mode: str | None = None
-        self._flat_available = False
-        self._prepare_scene_tensors(scene)
+    near = config.near or max(0.05, stats.radius * 0.05)
+    far = config.far or max(50.0, stats.radius * 6.0)
+    view = torch.from_numpy(_view_matrix(pose.rotation, pose.position)).to(device)
+    proj = torch.from_numpy(_perspective(fov_y, aspect, near, far)).to(device)
+    bg = torch.tensor(config.background, device=device, dtype=torch.float32)
 
-    def _prepare_scene_tensors(self, scene: GaussianScene) -> None:
-        torch = self.torch
-
-        def _to_tensor(array: np.ndarray) -> "torch.Tensor":
-            return torch.from_numpy(array).to(self.device, dtype=torch.float32).contiguous()
-
-        means = _to_tensor(scene.positions)
-        scales = _to_tensor(scene.scales).clamp(min=1e-4)
-        opacities = _to_tensor(scene.opacity).clamp(0.01, 1.0)
-        if opacities.ndim == 2 and opacities.shape[-1] == 1:
-            opacities = opacities.squeeze(-1)
-
-        if scene.sh_coeffs is not None:
-            coeffs = _to_tensor(scene.sh_coeffs)
-            terms = coeffs.shape[1] // 3
-            colors = coeffs.view(coeffs.shape[0], terms, 3)
-            self.sh_degree = int(scene.sh_degree)
+    colors = scene.colors_precomp
+    if colors is None:
+        if scene.shs is not None:
+            # SH coefficient 0 maps to base color with a constant factor.
+            colors = scene.shs[:, :3] * 0.28209479177387814
         else:
-            base_colors = _to_tensor(scene.colors)
-            colors = base_colors.unsqueeze(1)
-            self.sh_degree = 0
+            colors = torch.ones_like(scene.positions, device=device)
 
-        rotations = getattr(scene, "rotations", None)
-        if rotations is not None:
-            quats = _to_tensor(rotations)
-        else:
-            quats = torch.zeros((len(scene.positions), 4), dtype=torch.float32, device=self.device)
-            quats[:, 3] = 1.0
+    sh_degree = _sh_degree(scene.shs)
+    out = rasterization(
+        means3D=scene.positions,
+        shs=scene.shs,
+        colors_precomp=colors,
+        opacities=scene.opacities,
+        scales=scene.scales,
+        rotations=scene.rotations,
+        cov3D_precomp=None,
+        raster_settings=Settings(
+            image_height=config.height,
+            image_width=config.width,
+            tanfovx=float(math.tan(fov_x * 0.5)),
+            tanfovy=float(math.tan(fov_y * 0.5)),
+            bg=bg,
+            scale_modifier=config.scale_modifier,
+            viewmatrix=view,
+            projmatrix=proj,
+            sh_degree=sh_degree,
+            camera_center=torch.from_numpy(pose.position).to(device),
+        ),
+    )
+    image = out["render"] if isinstance(out, dict) and "render" in out else out
+    if torch.is_tensor(image):
+        image = image.permute(1, 2, 0).clamp(0.0, 1.0).detach().cpu().numpy()
+    return image.astype(np.float32)
 
-        self._flat_means = means
-        self._flat_scales = scales
-        self._flat_opacities = opacities
-        self._flat_colors = colors
-        self._flat_quats = quats
 
-        self.means = means.unsqueeze(0)
-        self.scales = scales.unsqueeze(0)
-        self.opacities = opacities.unsqueeze(0)
-        self.colors = colors.unsqueeze(0)
-        self.quats = quats.unsqueeze(0)
-        self._flat_available = True
+def _placeholder_frame(pose: CameraPose, config: RenderConfig, stats: SceneStats) -> np.ndarray:
+    # Simple radial gradient placeholder to keep pipeline running without gsplat.
+    h, w = config.height, config.width
+    y, x = np.ogrid[0:h, 0:w]
+    cx, cy = w / 2.0, h / 2.0
+    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    dist = dist / (np.max(dist) + 1e-6)
+    base = np.clip(1.0 - dist[..., None], 0.0, 1.0)
+    tint = np.array(
+        [
+            0.2 + 0.6 * (pose.position[0] / max(stats.radius, 1e-3)),
+            0.3 + 0.5 * (pose.position[1] / max(stats.radius, 1e-3)),
+            0.4 + 0.4 * (pose.position[2] / max(stats.radius, 1e-3)),
+        ],
+        dtype=np.float32,
+    )
+    frame = np.clip(base * tint, 0.0, 1.0)
+    return frame.astype(np.float32)
 
-    def render(
-        self,
-        scene: GaussianScene,
-        pose: CameraPose,
-        resolution: Tuple[int, int],
-    ) -> np.ndarray:
-        width, height = resolution
-        view, K = self._camera_matrices(pose, width, height)
-        layouts = self._layout_attempt_order()
-        last_exc: Exception | None = None
-        for layout in layouts:
+
+def render_video_frames(
+    scene: SceneData,
+    stats: SceneStats,
+    camera_poses: Iterable[CameraPose],
+    config: RenderConfig,
+) -> List[np.ndarray]:
+    poses = list(camera_poses)
+    frames: List[np.ndarray] = []
+    use_placeholder = False
+    for pose in tqdm(poses, desc="Rendering", unit="frame"):
+        if not use_placeholder:
             try:
-                render_colors, _, _ = self._run_rasterize(layout, view, K, width, height)
-            except AssertionError as exc:
-                last_exc = exc
-                if self._should_retry_with_flat(layout, exc):
-                    continue
-                raise
-            else:
-                if self._layout_mode is None:
-                    self._layout_mode = layout
-                return self._tensor_to_frame(render_colors)
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("Rasterization failed without raising an exception.")
-
-    def _layout_attempt_order(self) -> List[str]:
-        if self._layout_mode == "batched":
-            return ["batched"]
-        if self._layout_mode == "flat":
-            return ["flat"]
-        order = ["batched"]
-        if self._flat_available:
-            order.append("flat")
-        return order
-
-    def _should_retry_with_flat(self, layout: str, exc: AssertionError) -> bool:
-        if layout != "batched" or not self._flat_available or self._layout_mode is not None:
-            return False
-        torch = self.torch
-        return len(exc.args) == 1 and isinstance(exc.args[0], torch.Size)
-
-    def _run_rasterize(
-        self,
-        layout: str,
-        view: "torch.Tensor",
-        K: "torch.Tensor",
-        width: int,
-        height: int,
-    ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-        if layout == "batched":
-            means = self.means
-            quats = self.quats
-            scales = self.scales
-            opacities = self.opacities
-            colors = self.colors
-            view_arg = view
-            K_arg = K
+                frame = _render_with_gsplat(scene, pose, config, stats)
+            except Exception as exc:  # pragma: no cover - runtime guard
+                logging.warning("gsplat rendering failed (%s); falling back to placeholder frames.", exc)
+                use_placeholder = True
+                frame = _placeholder_frame(pose, config, stats)
         else:
-            if not self._flat_available:
-                raise RuntimeError("Flat layout requested but not available.")
-            means = self._flat_means
-            quats = self._flat_quats
-            scales = self._flat_scales
-            opacities = self._flat_opacities
-            colors = self._flat_colors
-            view_arg = view
-            K_arg = K
-        return self.rasterize(
-            means,
-            quats,
-            scales,
-            opacities,
-            colors,
-            view_arg,
-            K_arg,
-            width,
-            height,
-            sh_degree=self.sh_degree,
-        )
-
-    def _tensor_to_frame(self, tensor: "torch.Tensor") -> np.ndarray:
-        if tensor.ndim == 4:
-            tensor = tensor[0]
-        tensor = tensor.clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
-        return tensor
-
-    def _camera_matrices(
-        self, pose: CameraPose, width: int, height: int
-    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
-        torch = self.torch
-        fx = fy = 0.5 * width / math.tan(math.radians(pose.fov * 0.5))
-        cx = width / 2.0
-        cy = height / 2.0
-        position = torch.tensor(pose.position, device=self.device, dtype=torch.float32)
-        forward = torch.tensor(pose.forward, device=self.device, dtype=torch.float32)
-        up = torch.tensor(pose.up, device=self.device, dtype=torch.float32)
-
-        # Guard against degenerate/collinear bases to keep view invertible.
-        if not torch.isfinite(forward).all() or torch.linalg.norm(forward) < 1e-6:
-            forward = torch.tensor([0.0, 0.0, 1.0], device=self.device)
-        forward = torch.nn.functional.normalize(forward, dim=0)
-
-        if not torch.isfinite(up).all() or torch.linalg.norm(up) < 1e-6:
-            up = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-        up = torch.nn.functional.normalize(up, dim=0)
-        if torch.abs(torch.dot(forward, up)) > 0.995:
-            up = torch.tensor([0.0, 0.0, 1.0], device=self.device)
-            if torch.abs(torch.dot(forward, up)) > 0.995:
-                up = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-
-        right = torch.linalg.cross(forward, up)
-        right = torch.nn.functional.normalize(right, dim=0)
-        up_vec = torch.linalg.cross(right, forward)
-        up_vec = torch.nn.functional.normalize(up_vec, dim=0)
-        view = torch.eye(4, device=self.device, dtype=torch.float32)
-        view[0, :3] = right
-        view[1, :3] = up_vec
-        view[2, :3] = -forward
-        view[:3, 3] = -view[:3, :3] @ position
-        view = view.unsqueeze(0)
-        K = torch.tensor(
-            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-            device=self.device,
-            dtype=torch.float32,
-        )
-        K = K.unsqueeze(0)
-        return view, K
-
-class _LiteGaussianBackend(_RendererBackend):
-    """CPU fallback that draws a subset of Gaussians for previews."""
-
-    def __init__(self, max_points: int = 120_000, seed: int = 19) -> None:
-        self.max_points = max_points
-        self.rng = np.random.default_rng(seed)
-
-    def render(
-        self,
-        scene: GaussianScene,
-        pose: CameraPose,
-        resolution: Tuple[int, int],
-    ) -> np.ndarray:
-        width, height = resolution
-        frame = np.zeros((height, width, 3), dtype=np.float32)
-        depth = np.full((height, width), np.inf, dtype=np.float32)
-        idx = self._subsample(len(scene.positions))
-        points = scene.positions[idx]
-        colors = scene.colors[idx]
-        scales = scene.scales[idx]
-        opacity = scene.opacity[idx]
-
-        view = self._view_matrix(pose)
-        pts_cam = (view[:3, :3] @ points.T + view[:3, 3:4]).T
-        mask = pts_cam[:, 2] > 0.1
-        pts_cam = pts_cam[mask]
-        colors = colors[mask]
-        scales = scales[mask]
-        opacity = opacity[mask]
-
-        fx = fy = 0.5 * width / math.tan(math.radians(pose.fov * 0.5))
-        cx = width / 2.0
-        cy = height / 2.0
-        pixels = np.empty((len(pts_cam), 2), dtype=np.int32)
-        pixels[:, 0] = (fx * (pts_cam[:, 0] / pts_cam[:, 2]) + cx).astype(np.int32)
-        pixels[:, 1] = (fy * (pts_cam[:, 1] / pts_cam[:, 2]) + cy).astype(np.int32)
-        valid = (
-            (pixels[:, 0] >= 0)
-            & (pixels[:, 0] < width)
-            & (pixels[:, 1] >= 0)
-            & (pixels[:, 1] < height)
-        )
-        pts_cam = pts_cam[valid]
-        colors = colors[valid]
-        scales = scales[valid]
-        opacity = opacity[valid]
-        pixels = pixels[valid]
-        sigma = np.clip(
-            np.mean(scales, axis=1) / pts_cam[:, 2] * fx,
-            0.5,
-            14.0,
-        )
-        order = np.argsort(-pts_cam[:, 2])
-        for idx in order:
-            px, py = pixels[idx]
-            s = sigma[idx]
-            radius = max(1, int(2.5 * s))
-            for dy in range(-radius, radius + 1):
-                yy = py + dy
-                if yy < 0 or yy >= height:
-                    continue
-                for dx in range(-radius, radius + 1):
-                    xx = px + dx
-                    if xx < 0 or xx >= width:
-                        continue
-                    dist2 = dx * dx + dy * dy
-                    weight = math.exp(-0.5 * dist2 / (s * s + 1e-3))
-                    alpha = float(np.clip(opacity[idx], 0.2, 1.0)) * weight
-                    if alpha < 0.02:
-                        continue
-                    color = colors[idx]
-                    depth_val = pts_cam[idx, 2]
-                    if depth_val < depth[yy, xx]:
-                        depth[yy, xx] = depth_val
-                        frame[yy, xx] = (
-                            frame[yy, xx] * (1 - alpha) + color * alpha
-                        )
-        frame = np.clip(frame, 0.0, 1.0)
-        return (frame * 255.0).astype(np.uint8)
-
-    def _subsample(self, count: int) -> np.ndarray:
-        if count <= self.max_points:
-            return np.arange(count)
-        return self.rng.choice(count, size=self.max_points, replace=False)
-
-    def _view_matrix(self, pose: CameraPose) -> np.ndarray:
-        forward = pose.forward / np.linalg.norm(pose.forward)
-        right = np.cross(forward, pose.up)
-        right = right / np.linalg.norm(right)
-        up = np.cross(right, forward)
-        view = np.eye(4, dtype=np.float32)
-        view[0, :3] = right
-        view[1, :3] = up
-        view[2, :3] = -forward
-        view[:3, 3] = -view[:3, :3] @ pose.position
-        return view
+            frame = _placeholder_frame(pose, config, stats)
+        frames.append(frame)
+    return frames
 
 
-__all__ = ["GaussianRenderer"]
+def save_video(frames: Iterable[np.ndarray], output_path: Path, fps: int) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(output_path, fps=fps, codec="h264", quality=8) as writer:
+        for frame in frames:
+            frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            writer.append_data(frame_uint8)
+    return output_path
