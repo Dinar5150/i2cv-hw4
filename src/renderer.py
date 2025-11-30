@@ -60,15 +60,10 @@ def _get_raster_components():
     settings_candidates = [
         ("gsplat.cuda.rasterization", "GSplatRasterizationSettings"),
         ("gsplat.cuda.rasterization", "GaussianRasterizationSettings"),
-        ("gsplat.render", "GSplatRasterizationSettings"),  # legacy
-        ("gsplat.render", "GaussianRasterizationSettings"),
-        ("gsplat.render", "RasterizationSettings"),
     ]
     raster_candidates = [
         ("gsplat.cuda.rasterization", "rasterization"),
         ("gsplat.cuda.rasterization", "gaussian_rasterization"),
-        ("gsplat.render", "rasterization"),
-        ("gsplat.render", "gaussian_rasterization"),
     ]
 
     Settings = None
