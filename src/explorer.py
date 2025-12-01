@@ -71,7 +71,11 @@ def generate_exploration_waypoints(
         pos[idx2] = center[idx2] + val_2
         
         # Look slightly ahead on the path
-        look_phase = phase + 0.2
+        # To move "forward", we look at where we will be in the future.
+        # If the camera feels like it's moving backward, it means the look_at is "behind" the motion vector.
+        # Let's look further ahead along the path.
+        look_phase = phase + 0.1  # Small positive delta looks "forward" in time
+        
         look_principal = math.sin(look_phase) * amp_principal
         look_1 = math.sin(look_phase * 2.0) * amp1
         look_2 = math.sin(look_phase * 3.0) * amp2

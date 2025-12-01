@@ -64,7 +64,8 @@ def _render_with_gsplat(
     fov_y = math.radians(config.fov)
     fov_x = 2 * math.atan(math.tan(fov_y / 2) * aspect)
 
-    near = config.near or max(0.05, stats.radius * 0.05)
+    # Reduce near plane to allow rendering splats very close to the camera
+    near = config.near or 0.01
     far = config.far or max(50.0, stats.radius * 6.0)
     view = torch.from_numpy(_view_matrix(pose.rotation, pose.position)).to(device)
 
