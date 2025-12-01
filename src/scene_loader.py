@@ -44,6 +44,8 @@ def load_ply(path: str, device: torch.device):
     positions = np.stack((v["x"], v["y"], v["z"]), axis=1)
 
     # Opacity: Standard 3DGS PLY stores logits, we need sigmoid for gsplat v1.0+
+    # If the PLY is uncompressed/raw, it might already be in [0,1] or logit.
+    # Standard 3DGS convention is logits.
     opacities = v["opacity"][..., None]
     opacities = 1.0 / (1.0 + np.exp(-opacities))
 
@@ -68,10 +70,13 @@ def load_ply(path: str, device: torch.device):
     # Rest
     f_rest_names = [p.name for p in v.properties if p.name.startswith("f_rest_")]
     f_rest_names = sorted(f_rest_names, key=lambda x: int(x.split('_')[-1]))
-    f_rest = np.stack([v[n] for n in f_rest_names], axis=1).reshape(-1, len(f_rest_names) // 3, 3)
     
-    # Concatenate SHs: (N, K, 3)
-    shs = np.concatenate([f_dc, f_rest], axis=1)
+    if f_rest_names:
+        f_rest = np.stack([v[n] for n in f_rest_names], axis=1).reshape(-1, len(f_rest_names) // 3, 3)
+        shs = np.concatenate([f_dc, f_rest], axis=1)
+    else:
+        shs = f_dc
+    
     # Flatten to (N, K*3) if your SceneData expects that, or keep as (N, K, 3)
     # Based on renderer.py, it handles flattened or structured, but let's flatten to match typical gsplat.io behavior
     shs = shs.reshape(shs.shape[0], -1)
