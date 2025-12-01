@@ -41,6 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orbits", type=int, default=2, help="Number of wide orbits to seed the path.")
     parser.add_argument("--orbit-points", type=int, default=60, help="Samples per orbit.")
     parser.add_argument("--hold", type=float, default=0.6, help="Hold duration (seconds) at start/end.")
+    parser.add_argument("--duration", type=float, default=None, help="Force total video duration in seconds (overrides speed).")
     parser.add_argument("--detect", action="store_true", help="Enable YOLO detection on rendered frames.")
     return parser
 
@@ -92,6 +93,7 @@ def main():
         nominal_speed=args.speed,
         fov=args.fov,
         hold_seconds=args.hold,
+        forced_duration=args.duration,
     )
     logging.info("Camera poses: %d frames", len(poses))
 

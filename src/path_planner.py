@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Sequence, Optional
 
 from scipy.interpolate import CubicSpline
 
@@ -58,6 +58,7 @@ def smooth_camera_path(
     nominal_speed: float = 0.8,
     fov: float = 60.0,
     hold_seconds: float = 0.6,
+    forced_duration: Optional[float] = None,
 ) -> List[CameraPose]:
     """
     Turn coarse waypoints into a dense, smooth camera path with orientations.
@@ -73,8 +74,12 @@ def smooth_camera_path(
     look_at_wp = np.stack([w.look_at for w in waypoints], axis=0)
 
     # Estimate total frames from path length and desired speed.
-    coarse_length = _estimate_path_length(positions_wp)
-    duration = max(coarse_length / max(nominal_speed, 1e-3), 4.0)
+    if forced_duration is not None:
+        duration = forced_duration
+    else:
+        coarse_length = _estimate_path_length(positions_wp)
+        duration = max(coarse_length / max(nominal_speed, 1e-3), 4.0)
+
     base_frames = int(duration * fps)
     num_frames = max(base_frames, len(waypoints) * 8)
 
