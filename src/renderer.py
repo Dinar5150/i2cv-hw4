@@ -89,8 +89,7 @@ def _render_with_gsplat(
 
     # Modern gsplat.rendering.rasterization interface (batch size 1).
     viewmats = view.unsqueeze(0)
-    bg = torch.tensor(config.background, device=device, dtype=torch.float32)
-
+    
     out = rasterization(
         means=scene.positions,
         quats=scene.rotations,
@@ -103,7 +102,6 @@ def _render_with_gsplat(
         height=config.height,
         sh_degree=sh_degree,
         render_mode="RGB",
-        backgrounds=bg.view(1, 1, 3),
         near_plane=near,
         far_plane=far,
         radius_clip=1e-4,
