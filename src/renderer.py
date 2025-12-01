@@ -2,7 +2,7 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Any
 
 import imageio.v2 as imageio
 import numpy as np
@@ -129,16 +129,25 @@ def render_video_frames(
     stats: SceneStats,
     camera_poses: Iterable[CameraPose],
     config: RenderConfig,
+    detector: Optional[Any] = None,
 ) -> List[np.ndarray]:
     poses = list(camera_poses)
     frames: List[np.ndarray] = []
     for pose in tqdm(poses, desc="Rendering", unit="frame"):
         try:
             frame = _render_with_gsplat(scene, pose, config, stats)
+            
+            # Convert to uint8 immediately
+            frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            
+            if detector is not None:
+                # Run detection and overlay
+                frame_uint8 = detector.detect_and_draw(frame_uint8)
+                
+            frames.append(frame_uint8)
         except Exception as exc:
             logging.error("gsplat rendering failed for a frame: %s", exc)
             raise exc
-        frames.append(frame)
     return frames
 
 
@@ -146,6 +155,8 @@ def save_video(frames: Iterable[np.ndarray], output_path: Path, fps: int) -> Pat
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(output_path, fps=fps, codec="h264", quality=8) as writer:
         for frame in frames:
-            frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-            writer.append_data(frame_uint8)
+            # Frame is already uint8
+            if frame.dtype != np.uint8:
+                frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            writer.append_data(frame)
     return output_path

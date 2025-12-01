@@ -9,6 +9,7 @@ from .explorer import generate_exploration_waypoints
 from .path_planner import smooth_camera_path
 from .renderer import RenderConfig, render_video_frames, save_video
 from .scene_loader import load_scene
+from .detector import YOLODetector
 
 
 def _parse_resolution(res: str) -> Tuple[int, int]:
@@ -40,6 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orbits", type=int, default=2, help="Number of wide orbits to seed the path.")
     parser.add_argument("--orbit-points", type=int, default=60, help="Samples per orbit.")
     parser.add_argument("--hold", type=float, default=0.6, help="Hold duration (seconds) at start/end.")
+    parser.add_argument("--detect", action="store_true", help="Enable YOLO detection on rendered frames.")
     return parser
 
 
@@ -50,6 +52,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     width, height = args.resolution
     device = torch.device(args.device) if args.device else None
+
+    # Initialize detector if requested
+    detector = None
+    if args.detect:
+        try:
+            detector = YOLODetector()
+        except Exception as e:
+            logging.warning("Failed to initialize YOLO detector: %s", e)
 
     logging.info("Loading scene: %s", args.scene)
     scene, stats, _ = load_scene(
@@ -86,7 +96,7 @@ def main():
 
     config = RenderConfig(width=width, height=height, fps=args.fps, fov=args.fov)
     logging.info("Rendering frames at %dx%d...", width, height)
-    frames = render_video_frames(scene, stats, poses, config)
+    frames = render_video_frames(scene, stats, poses, config, detector=detector)
 
     scene_name = Path(args.scene).stem
     output_path = Path(args.output) if args.output else Path("outputs") / scene_name / "panorama_tour.mp4"
