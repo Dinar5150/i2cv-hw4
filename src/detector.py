@@ -24,7 +24,4 @@ class YOLODetector:
         
         annotated_frame = results[0].plot()
         
-        # Annotated frame is BGR, convert to RGB
-        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-        
         return annotated_frame

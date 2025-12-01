@@ -46,9 +46,19 @@ def generate_exploration_waypoints(
     idx1, idx2 = other_indices[0], other_indices[1]
     
     # Amplitude for the motion (stay well within bounds)
-    amp_principal = extent[principal_idx] * 0.4
-    amp1 = extent[idx1] * 0.3
-    amp2 = extent[idx2] * 0.15
+    # Reduced significantly to prevent flying through walls (especially if scene is not axis-aligned)
+    # We also define a "safe box" which is smaller than the stats bbox.
+    bbox_size = stats.bbox_max - stats.bbox_min
+    safe_margin = 0.15  # 15% margin from the walls
+    safe_min = stats.bbox_min + bbox_size * safe_margin
+    safe_max = stats.bbox_max - bbox_size * safe_margin
+    
+    # Recalculate extent based on safe box
+    safe_extent = safe_max - safe_min
+    
+    amp_principal = safe_extent[principal_idx] * 0.45
+    amp1 = safe_extent[idx1] * 0.35
+    amp2 = safe_extent[idx2] * 0.20
     
     num_steps = 120
     
@@ -61,14 +71,16 @@ def generate_exploration_waypoints(
         # sin(t) starts at 0.
         val_principal = math.sin(phase) * amp_principal
         val_1 = math.sin(phase * 2.0) * amp1
-        val_2 = math.cos(phase) * amp2 - amp2 # Start at 0 if cos(0)=1, so subtract amp2? 
-        # Better: use sin for all to ensure 0 start
         val_2 = math.sin(phase * 3.0) * amp2
 
         pos = np.zeros(3, dtype=np.float32)
         pos[principal_idx] = center[principal_idx] + val_principal
         pos[idx1] = center[idx1] + val_1
         pos[idx2] = center[idx2] + val_2
+        
+        # Clamp to ensure we stay strictly within the calculated safe bounds
+        pos = np.maximum(pos, safe_min)
+        pos = np.minimum(pos, safe_max)
         
         # Look slightly ahead on the path
         # To move "forward", we look at where we will be in the future.
