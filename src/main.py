@@ -87,6 +87,7 @@ def main():
     logging.info("Smoothing camera path...")
     poses = smooth_camera_path(
         waypoints,
+        stats=stats,
         fps=args.fps,
         nominal_speed=args.speed,
         fov=args.fov,

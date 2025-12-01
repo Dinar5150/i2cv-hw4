@@ -5,6 +5,7 @@ from typing import List, Sequence
 from scipy.interpolate import CubicSpline
 
 from .explorer import Waypoint
+from .scene_loader import SceneStats
 
 
 @dataclass
@@ -52,6 +53,7 @@ def _sample_spline(points: np.ndarray, num: int) -> np.ndarray:
 
 def smooth_camera_path(
     waypoints: Sequence[Waypoint],
+    stats: SceneStats,
     fps: int = 24,
     nominal_speed: float = 0.8,
     fov: float = 60.0,
@@ -78,6 +80,16 @@ def smooth_camera_path(
 
     positions = _sample_spline(positions_wp, num_frames)
     look_targets = _sample_spline(look_at_wp, num_frames)
+    
+    # Clamp the interpolated positions to the safe bounds
+    # Re-calculate safe bounds (same logic as explorer.py)
+    bbox_size = stats.bbox_max - stats.bbox_min
+    safe_margin = 0.15
+    safe_min = stats.bbox_min + bbox_size * safe_margin
+    safe_max = stats.bbox_max - bbox_size * safe_margin
+    
+    positions = np.maximum(positions, safe_min)
+    positions = np.minimum(positions, safe_max)
 
     # Use path derivative to bias the look-at direction for forward motion.
     t = np.linspace(0.0, 1.0, positions_wp.shape[0])
