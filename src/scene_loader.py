@@ -36,77 +36,53 @@ class SceneTransform:
     translation: np.ndarray
 
 
-def _first_existing(mapping, keys, default=None):
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return default
+def load_ply(path: str, device: torch.device):
+    plydata = PlyData.read(path)
+    v = plydata.elements[0]
 
+    # Positions
+    positions = np.stack((v["x"], v["y"], v["z"]), axis=1)
 
-def _load_with_gsplat(ply_path: Path):
-    """
-    Use the current gsplat CUDA loader (gsplat >= 1.5) and fall back to legacy paths.
-    """
-    import importlib
+    # Opacity: Standard 3DGS PLY stores logits, we need sigmoid for gsplat v1.0+
+    opacities = v["opacity"][..., None]
+    opacities = 1.0 / (1.0 + np.exp(-opacities))
 
-    candidates = [
-        ("gsplat.cuda.io", "load_ply"),  # new API
-        ("gsplat.io", "load_ply"),  # legacy
-        ("gsplat.io.utils", "load_ply"),
-        ("gsplat.io.ply", "load_ply"),
-        ("gsplat", "load_ply"),
-    ]
-    last_err = None
-    for mod_name, attr in candidates:
-        try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, attr):
-                return getattr(mod, attr)(str(ply_path))
-        except Exception as exc:  # pragma: no cover - environment specific
-            last_err = exc
-            continue
-    logging.error("gsplat load_ply not found or failed: %s", last_err)
-    raise ImportError(
-        "gsplat is required to load the Gaussian splat PLY. "
-        "Install with `pip install gsplat` or from source."
-    ) from last_err
+    # Scales: Standard 3DGS PLY stores log-scales, we need exp
+    scale_names = [p.name for p in v.properties if p.name.startswith("scale_")]
+    scale_names = sorted(scale_names, key=lambda x: int(x.split('_')[-1]))
+    scales = np.stack([v[n] for n in scale_names], axis=1)
+    scales = np.exp(scales)
 
+    # Rotations: (N, 4)
+    rot_names = [p.name for p in v.properties if p.name.startswith("rot_")]
+    rot_names = sorted(rot_names, key=lambda x: int(x.split('_')[-1]))
+    rotations = np.stack([v[n] for n in rot_names], axis=1)
+    # Normalize quaternions
+    norm = np.linalg.norm(rotations, axis=1, keepdims=True)
+    rotations = rotations / (norm + 1e-8)
 
-def _fallback_load_ply(ply_path: Path):
-    """Minimal PLY reader when gsplat's loader is unavailable."""
-    logging.warning("Falling back to plain PLY parsing; install gsplat for optimal loading.")
-    ply = PlyData.read(str(ply_path))
-    vertex = ply["vertex"].data
-    positions = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1)
-    opacities = vertex["opacity"] if "opacity" in vertex.dtype.names else np.ones(len(vertex))
-    scales = np.stack(
-        [
-            vertex["scale_0"] if "scale_0" in vertex.dtype.names else np.ones(len(vertex)),
-            vertex["scale_1"] if "scale_1" in vertex.dtype.names else np.ones(len(vertex)),
-            vertex["scale_2"] if "scale_2" in vertex.dtype.names else np.ones(len(vertex)),
-        ],
-        axis=1,
+    # Spherical Harmonics
+    # DC
+    f_dc = np.stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]], axis=1).reshape(-1, 1, 3)
+    
+    # Rest
+    f_rest_names = [p.name for p in v.properties if p.name.startswith("f_rest_")]
+    f_rest_names = sorted(f_rest_names, key=lambda x: int(x.split('_')[-1]))
+    f_rest = np.stack([v[n] for n in f_rest_names], axis=1).reshape(-1, len(f_rest_names) // 3, 3)
+    
+    # Concatenate SHs: (N, K, 3)
+    shs = np.concatenate([f_dc, f_rest], axis=1)
+    # Flatten to (N, K*3) if your SceneData expects that, or keep as (N, K, 3)
+    # Based on renderer.py, it handles flattened or structured, but let's flatten to match typical gsplat.io behavior
+    shs = shs.reshape(shs.shape[0], -1)
+
+    return (
+        torch.from_numpy(positions).float().to(device),
+        torch.from_numpy(rotations).float().to(device),
+        torch.from_numpy(scales).float().to(device),
+        torch.from_numpy(opacities).float().to(device),
+        torch.from_numpy(shs).float().to(device),
     )
-    rotations = np.stack(
-        [
-            vertex["rot_0"] if "rot_0" in vertex.dtype.names else np.ones(len(vertex)),
-            vertex["rot_1"] if "rot_1" in vertex.dtype.names else np.zeros(len(vertex)),
-            vertex["rot_2"] if "rot_2" in vertex.dtype.names else np.zeros(len(vertex)),
-            vertex["rot_3"] if "rot_3" in vertex.dtype.names else np.zeros(len(vertex)),
-        ],
-        axis=1,
-    )
-    colors = None
-    if "red" in vertex.dtype.names:
-        colors = np.stack([vertex["red"], vertex["green"], vertex["blue"]], axis=1) / 255.0
-    return {
-        "positions": torch.from_numpy(positions).float(),
-        "scales": torch.from_numpy(scales).float(),
-        "rotations": torch.from_numpy(rotations).float(),
-        "opacities": torch.from_numpy(opacities).float().unsqueeze(-1),
-        "colors_precomp": torch.from_numpy(colors).float() if colors is not None else None,
-        "shs": None,
-    }
 
 
 def _compute_stats(positions: torch.Tensor) -> SceneStats:
@@ -161,43 +137,10 @@ def load_scene(
         raise FileNotFoundError(f"Missing scene PLY: {path}")
 
     device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    try:
-        payload = _load_with_gsplat(path)
-    except Exception:
-        payload = _fallback_load_ply(path)
-
-    positions = _first_existing(payload, ["positions", "xyz", "means3D", "means"])
-    if positions is None:
-        raise ValueError("PLY payload did not contain positions/xyz data.")
-    scales = _first_existing(payload, ["scales", "scale"])
-    rotations = _first_existing(payload, ["rotations", "rotation", "rot"])
-    opacities = _first_existing(payload, ["opacities", "opacity"])
-
-    def _to_tensor(value):
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            return value.float().to(device)
-        return torch.from_numpy(np.asarray(value)).float().to(device)
-
-    positions = _to_tensor(positions)
-    scales = _to_tensor(scales)
-    rotations = _to_tensor(rotations)
-    opacities = _to_tensor(opacities)
-    if scales is None:
-        scales = torch.ones((positions.shape[0], 3), device=device, dtype=positions.dtype)
-    if rotations is None:
-        rot_id = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, dtype=positions.dtype)
-        rotations = rot_id.repeat(positions.shape[0], 1)
-    if opacities is None:
-        opacities = torch.ones((positions.shape[0], 1), device=device, dtype=positions.dtype)
-    if opacities.ndim == 1:
-        opacities = opacities.unsqueeze(-1)
-
-    shs = payload.get("shs") or payload.get("features") or payload.get("features_dc")
-    colors_precomp = payload.get("colors_precomp")
-    shs = _to_tensor(shs)
-    colors_precomp = _to_tensor(colors_precomp)
+    
+    # Load using custom PLY loader
+    positions, rotations, scales, opacities, shs = load_ply(str(path), device)
+    colors_precomp = None
 
     stats = _compute_stats(positions)
     transform = _build_transform(stats, normalize=normalize, target_radius=target_radius)
@@ -216,8 +159,8 @@ def load_scene(
         scales=scales,
         rotations=rotations,
         opacities=opacities,
-        shs=shs if isinstance(shs, torch.Tensor) else None,
-        colors_precomp=colors_precomp if isinstance(colors_precomp, torch.Tensor) else None,
+        shs=shs,
+        colors_precomp=colors_precomp,
         device=device,
     )
     return scene, stats, transform

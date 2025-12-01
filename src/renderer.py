@@ -110,8 +110,14 @@ def _render_with_gsplat(
         packed=False,
     )
 
-    # gsplat returns (B, H, W, 3)
-    image = out["rgb"] if isinstance(out, dict) and "rgb" in out else out
+    # gsplat returns (B, H, W, 3) or (colors, alphas, info)
+    if isinstance(out, tuple):
+        image = out[0]
+    elif isinstance(out, dict) and "rgb" in out:
+        image = out["rgb"]
+    else:
+        image = out
+
     if torch.is_tensor(image):
         if image.ndim == 4:
             image = image[0]

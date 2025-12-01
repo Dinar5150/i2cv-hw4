@@ -3,4 +3,3 @@ scipy
 tqdm
 imageio[ffmpeg]
 plyfile
-gsplat
