@@ -29,52 +29,56 @@ def generate_exploration_waypoints(
 ) -> List[Waypoint]:
     """
     Produce a set of coarse camera waypoints covering the scene.
-
-    The strategy mixes wide orbits with a forward sweep across the scene's
-    dominant axis to get parallax and coverage.
+    Generates a cinematic flyby path.
     """
     center = stats.center
-    base_radius = max(stats.radius * 1.35, stats.scale * 0.75 + 1e-3)
-    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     waypoints: List[Waypoint] = []
 
-    # Start at the origin; if that coincides with the look target, nudge forward.
-    start_pos = np.zeros(3, dtype=np.float32)
-    start_look = center.copy()
-    if np.linalg.norm(start_pos - start_look) < 1e-4:
-        start_look = start_pos + np.array([0.0, 0.0, max(stats.radius, 1.0)], dtype=np.float32)
-    waypoints.append(Waypoint(position=start_pos, look_at=start_look))
-
-    for orbit_id in range(num_orbits):
-        radius = base_radius * (1.0 - 0.12 * orbit_id)
-        height = stats.radius * (0.15 + 0.1 * orbit_id)
-        for i in range(points_per_orbit):
-            theta = 2 * math.pi * (i / points_per_orbit) + orbit_id * 0.6
-            vertical = math.sin(theta * 0.5) * arc_elevation * stats.radius
-            pos = center + np.array(
-                [
-                    math.cos(theta) * radius,
-                    height + vertical,
-                    math.sin(theta) * radius,
-                ],
-                dtype=np.float32,
-            )
-            waypoints.append(Waypoint(position=pos, look_at=center.copy()))
-
-    # Add a dolly sweep along the largest extent to peek across the interior.
-    sweep_axis = _principal_axis(stats)
-    sweep_dir = sweep_axis if np.linalg.norm(sweep_axis) > 0 else np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    sweep_dir = sweep_dir / (np.linalg.norm(sweep_dir) + 1e-8)
-    sweep_span = base_radius * 1.4
-    sweep_height = stats.radius * 0.12
-    sweep_start = center + sweep_dir * sweep_span + up * sweep_height
-    sweep_end = center - sweep_dir * sweep_span + up * sweep_height * 0.5
-    for alpha in np.linspace(0.0, 1.0, num=24):
-        pos = sweep_start * (1 - alpha) + sweep_end * alpha
-        look_at = center + sweep_dir * (0.15 * base_radius) * (0.5 - alpha)
+    # Determine the principal axis of the scene (longest dimension)
+    extent = stats.bbox_max - stats.bbox_min
+    principal_idx = int(np.argmax(extent))
+    
+    # Create a path that flies through the scene along the principal axis
+    # We'll use a sine wave pattern for lateral movement to make it more interesting
+    
+    # Start from one end of the bounding box
+    axis_len = extent[principal_idx]
+    start_val = stats.bbox_min[principal_idx] + axis_len * 0.1
+    end_val = stats.bbox_max[principal_idx] - axis_len * 0.1
+    
+    num_steps = 100
+    
+    # Secondary axes indices
+    other_indices = [i for i in range(3) if i != principal_idx]
+    idx1, idx2 = other_indices[0], other_indices[1]
+    
+    # Amplitude for the sine wave motion
+    amp1 = extent[idx1] * 0.2
+    amp2 = extent[idx2] * 0.1
+    
+    for i in range(num_steps):
+        t = i / (num_steps - 1)
+        
+        # Position along principal axis
+        curr_val = start_val + (end_val - start_val) * t
+        
+        # Lateral motion
+        offset1 = math.sin(t * math.pi * 2) * amp1
+        offset2 = math.cos(t * math.pi * 1.5) * amp2
+        
+        pos = np.zeros(3, dtype=np.float32)
+        pos[principal_idx] = curr_val
+        pos[idx1] = center[idx1] + offset1
+        pos[idx2] = center[idx2] + offset2
+        
+        # Look slightly ahead on the path
+        look_t = min(1.0, t + 0.1)
+        look_val = start_val + (end_val - start_val) * look_t
+        look_at = np.zeros(3, dtype=np.float32)
+        look_at[principal_idx] = look_val
+        look_at[idx1] = center[idx1] + math.sin(look_t * math.pi * 2) * amp1 * 0.5
+        look_at[idx2] = center[idx2] + math.cos(look_t * math.pi * 1.5) * amp2 * 0.5
+        
         waypoints.append(Waypoint(position=pos, look_at=look_at))
 
-    # Finish on a slightly elevated hero shot.
-    final_pos = center + np.array([0.0, stats.radius * 0.3, base_radius * 0.8], dtype=np.float32)
-    waypoints.append(Waypoint(position=final_pos, look_at=center.copy()))
     return waypoints
