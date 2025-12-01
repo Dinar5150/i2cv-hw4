@@ -92,8 +92,9 @@ def load_ply(path: str, device: torch.device):
 
 def _compute_stats(positions: torch.Tensor) -> SceneStats:
     pos_np = positions.detach().cpu().numpy()
-    bbox_min = pos_np.min(axis=0)
-    bbox_max = pos_np.max(axis=0)
+    # Use percentiles to ignore outliers (e.g. floaters far away)
+    bbox_min = np.percentile(pos_np, 15.0, axis=0)
+    bbox_max = np.percentile(pos_np, 85.0, axis=0)
     center = 0.5 * (bbox_min + bbox_max)
     radius = float(np.linalg.norm(bbox_max - bbox_min)) * 0.5
     scale = float(np.max(bbox_max - bbox_min))
