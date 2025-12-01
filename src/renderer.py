@@ -51,54 +51,13 @@ def _sh_degree(shs: Optional[torch.Tensor]) -> int:
     return max(degree, 0)
 
 
-def _get_raster_components():
-    """
-    Resolve the gsplat rasterization entrypoints, preferring the current CUDA API.
-    """
-    import importlib
-
-    settings_candidates = [
-        ("gsplat.cuda.rasterization", "GSplatRasterizationSettings"),
-        ("gsplat.cuda.rasterization", "GaussianRasterizationSettings"),
-    ]
-    raster_candidates = [
-        ("gsplat.cuda.rasterization", "rasterization"),
-        ("gsplat.cuda.rasterization", "gaussian_rasterization"),
-    ]
-
-    Settings = None
-    rasterization = None
-    errors = []
-
-    for mod_name, attr in settings_candidates:
-        try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, attr):
-                Settings = getattr(mod, attr)
-                break
-        except Exception as exc:
-            errors.append((mod_name, attr, str(exc)))
-
-    for mod_name, attr in raster_candidates:
-        try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, attr):
-                rasterization = getattr(mod, attr)
-                break
-        except Exception as exc:
-            errors.append((mod_name, attr, str(exc)))
-
-    if Settings is None or rasterization is None:
-        logging.error("gsplat raster components not found; attempts: %s", errors)
-    return Settings, rasterization
-
-
 def _render_with_gsplat(
     scene: SceneData, pose: CameraPose, config: RenderConfig, stats: SceneStats
 ) -> np.ndarray:
-    Settings, rasterization = _get_raster_components()
-    if Settings is None or rasterization is None:
-        raise ImportError("gsplat rendering components were not found.")
+    try:
+        from gsplat import rasterization
+    except Exception as exc:
+        raise ImportError("gsplat rendering components were not found.") from exc
 
     device = scene.device
     aspect = config.width / config.height
@@ -108,42 +67,55 @@ def _render_with_gsplat(
     near = config.near or max(0.05, stats.radius * 0.05)
     far = config.far or max(50.0, stats.radius * 6.0)
     view = torch.from_numpy(_view_matrix(pose.rotation, pose.position)).to(device)
-    proj = torch.from_numpy(_perspective(fov_y, aspect, near, far)).to(device)
-    bg = torch.tensor(config.background, device=device, dtype=torch.float32)
+
+    # Intrinsics matrix from FOV.
+    fx = (config.width * 0.5) / math.tan(fov_x * 0.5)
+    fy = (config.height * 0.5) / math.tan(fov_y * 0.5)
+    cx = config.width * 0.5
+    cy = config.height * 0.5
+    K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], device=device, dtype=torch.float32).unsqueeze(0)
 
     colors = scene.colors_precomp
     if colors is None:
         if scene.shs is not None:
-            # SH coefficient 0 maps to base color with a constant factor.
             colors = scene.shs[:, :3] * 0.28209479177387814
         else:
             colors = torch.ones_like(scene.positions, device=device)
+    # If SHs are provided as flattened bands, reshape to [N, K, 3].
+    if scene.shs is not None and scene.shs.dim() == 2 and scene.shs.shape[1] % 3 == 0:
+        colors = scene.shs.view(scene.shs.shape[0], -1, 3)
 
     sh_degree = _sh_degree(scene.shs)
+
+    # Modern gsplat.rendering.rasterization interface (batch size 1).
+    viewmats = view.unsqueeze(0)
+    bg = torch.tensor(config.background, device=device, dtype=torch.float32)
+
     out = rasterization(
-        means3D=scene.positions,
-        shs=scene.shs,
-        colors_precomp=colors,
-        opacities=scene.opacities,
+        means=scene.positions,
+        quats=scene.rotations,
         scales=scene.scales,
-        rotations=scene.rotations,
-        cov3D_precomp=None,
-        raster_settings=Settings(
-            image_height=config.height,
-            image_width=config.width,
-            tanfovx=float(math.tan(fov_x * 0.5)),
-            tanfovy=float(math.tan(fov_y * 0.5)),
-            bg=bg,
-            scale_modifier=config.scale_modifier,
-            viewmatrix=view,
-            projmatrix=proj,
-            sh_degree=sh_degree,
-            camera_center=torch.from_numpy(pose.position).to(device),
-        ),
+        opacities=scene.opacities.squeeze(-1) if scene.opacities.ndim == 2 else scene.opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=K,
+        width=config.width,
+        height=config.height,
+        sh_degree=sh_degree,
+        render_mode="RGB",
+        backgrounds=bg.view(1, 1, 3),
+        near_plane=near,
+        far_plane=far,
+        radius_clip=1e-4,
+        packed=False,
     )
-    image = out["render"] if isinstance(out, dict) and "render" in out else out
+
+    # gsplat returns (B, H, W, 3)
+    image = out["rgb"] if isinstance(out, dict) and "rgb" in out else out
     if torch.is_tensor(image):
-        image = image.permute(1, 2, 0).clamp(0.0, 1.0).detach().cpu().numpy()
+        if image.ndim == 4:
+            image = image[0]
+        image = image.clamp(0.0, 1.0).detach().cpu().numpy()
     return image.astype(np.float32)
 
 
