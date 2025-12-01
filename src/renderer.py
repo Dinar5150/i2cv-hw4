@@ -125,26 +125,6 @@ def _render_with_gsplat(
     return image.astype(np.float32)
 
 
-def _placeholder_frame(pose: CameraPose, config: RenderConfig, stats: SceneStats) -> np.ndarray:
-    # Simple radial gradient placeholder to keep pipeline running without gsplat.
-    h, w = config.height, config.width
-    y, x = np.ogrid[0:h, 0:w]
-    cx, cy = w / 2.0, h / 2.0
-    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    dist = dist / (np.max(dist) + 1e-6)
-    base = np.clip(1.0 - dist[..., None], 0.0, 1.0)
-    tint = np.array(
-        [
-            0.2 + 0.6 * (pose.position[0] / max(stats.radius, 1e-3)),
-            0.3 + 0.5 * (pose.position[1] / max(stats.radius, 1e-3)),
-            0.4 + 0.4 * (pose.position[2] / max(stats.radius, 1e-3)),
-        ],
-        dtype=np.float32,
-    )
-    frame = np.clip(base * tint, 0.0, 1.0)
-    return frame.astype(np.float32)
-
-
 def render_video_frames(
     scene: SceneData,
     stats: SceneStats,
@@ -153,17 +133,12 @@ def render_video_frames(
 ) -> List[np.ndarray]:
     poses = list(camera_poses)
     frames: List[np.ndarray] = []
-    use_placeholder = False
     for pose in tqdm(poses, desc="Rendering", unit="frame"):
-        if not use_placeholder:
-            try:
-                frame = _render_with_gsplat(scene, pose, config, stats)
-            except Exception as exc:  # pragma: no cover - runtime guard
-                logging.warning("gsplat rendering failed (%s); falling back to placeholder frames.", exc)
-                use_placeholder = True
-                frame = _placeholder_frame(pose, config, stats)
-        else:
-            frame = _placeholder_frame(pose, config, stats)
+        try:
+            frame = _render_with_gsplat(scene, pose, config, stats)
+        except Exception as exc:
+            logging.error("gsplat rendering failed for a frame: %s", exc)
+            raise exc
         frames.append(frame)
     return frames
 
