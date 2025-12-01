@@ -29,7 +29,7 @@ def generate_exploration_waypoints(
 ) -> List[Waypoint]:
     """
     Produce a set of coarse camera waypoints covering the scene.
-    Generates a cinematic flyby path.
+    Generates a cinematic flyby path starting from the center.
     """
     center = stats.center
     waypoints: List[Waypoint] = []
@@ -38,46 +38,48 @@ def generate_exploration_waypoints(
     extent = stats.bbox_max - stats.bbox_min
     principal_idx = int(np.argmax(extent))
     
-    # Create a path that flies through the scene along the principal axis
-    # We'll use a sine wave pattern for lateral movement to make it more interesting
-    
-    # Start from one end of the bounding box
-    axis_len = extent[principal_idx]
-    start_val = stats.bbox_min[principal_idx] + axis_len * 0.1
-    end_val = stats.bbox_max[principal_idx] - axis_len * 0.1
-    
-    num_steps = 100
+    # Start exactly at the center (0,0,0)
+    # Then move outwards along the principal axis in a figure-8 or spiral
     
     # Secondary axes indices
     other_indices = [i for i in range(3) if i != principal_idx]
     idx1, idx2 = other_indices[0], other_indices[1]
     
-    # Amplitude for the sine wave motion
-    amp1 = extent[idx1] * 0.2
-    amp2 = extent[idx2] * 0.1
+    # Amplitude for the motion (stay well within bounds)
+    amp_principal = extent[principal_idx] * 0.4
+    amp1 = extent[idx1] * 0.3
+    amp2 = extent[idx2] * 0.15
+    
+    num_steps = 120
     
     for i in range(num_steps):
         t = i / (num_steps - 1)
+        # Map t to a phase that starts at 0
+        phase = t * math.pi * 2.0
         
-        # Position along principal axis
-        curr_val = start_val + (end_val - start_val) * t
-        
-        # Lateral motion
-        offset1 = math.sin(t * math.pi * 2) * amp1
-        offset2 = math.cos(t * math.pi * 1.5) * amp2
-        
+        # Lissajous-like path starting at (0,0,0)
+        # sin(t) starts at 0.
+        val_principal = math.sin(phase) * amp_principal
+        val_1 = math.sin(phase * 2.0) * amp1
+        val_2 = math.cos(phase) * amp2 - amp2 # Start at 0 if cos(0)=1, so subtract amp2? 
+        # Better: use sin for all to ensure 0 start
+        val_2 = math.sin(phase * 3.0) * amp2
+
         pos = np.zeros(3, dtype=np.float32)
-        pos[principal_idx] = curr_val
-        pos[idx1] = center[idx1] + offset1
-        pos[idx2] = center[idx2] + offset2
+        pos[principal_idx] = center[principal_idx] + val_principal
+        pos[idx1] = center[idx1] + val_1
+        pos[idx2] = center[idx2] + val_2
         
         # Look slightly ahead on the path
-        look_t = min(1.0, t + 0.1)
-        look_val = start_val + (end_val - start_val) * look_t
+        look_phase = phase + 0.2
+        look_principal = math.sin(look_phase) * amp_principal
+        look_1 = math.sin(look_phase * 2.0) * amp1
+        look_2 = math.sin(look_phase * 3.0) * amp2
+        
         look_at = np.zeros(3, dtype=np.float32)
-        look_at[principal_idx] = look_val
-        look_at[idx1] = center[idx1] + math.sin(look_t * math.pi * 2) * amp1 * 0.5
-        look_at[idx2] = center[idx2] + math.cos(look_t * math.pi * 1.5) * amp2 * 0.5
+        look_at[principal_idx] = center[principal_idx] + look_principal
+        look_at[idx1] = center[idx1] + look_1
+        look_at[idx2] = center[idx2] + look_2
         
         waypoints.append(Waypoint(position=pos, look_at=look_at))
 
